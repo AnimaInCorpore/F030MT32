@@ -14,8 +14,9 @@ template; this one is not started.
 
 ## Project status
 
-**This is a scaffold, not a synthesizer.** Nothing of the MT-32 is implemented.
-What exists is the skeleton the synthesizer will be built inside:
+**This is a scaffold with one measured partial, not a synthesizer.** What
+exists is the skeleton the synthesizer will be built inside, plus the
+feasibility spike that decides how much of one fits:
 
 - a DSP program that boots through the embedded two-stage loader, answers the
   v1 protocol, and drives the codec from two 512-frame stereo periods with a
@@ -26,26 +27,33 @@ What exists is the skeleton the synthesizer will be built inside:
   exists;
 - a 68030 program that boots the DSP, runs both sources, reports the codec
   frame and period counters, and restores the sound system on every exit path;
-- the build system, the Hatari smoke gate, and the documented contracts.
+- the build system, the Hatari smoke gate, and the documented contracts;
+- one LA32 synth partial on the DSP, bit-exact against Munt's integer model
+  with its controls held per block, with the native oracle and the
+  Hatari profiling harness that measure it (`make profile-partials`).
 
-The parts that decide whether the project is possible at all have not been
-done. In order:
+Of the three questions that decide whether the project is possible, the first
+is answered and the answer is hard:
 
-1. **The cycle budget is not established.** The Falcon DSP has 489.40
-   instruction cycles per codec frame and the MT-32 has 32 partials. Nobody
-   has yet measured what one LA32 partial costs on a DSP56001, so nobody knows
-   what fraction of an MT-32 fits. See
+1. **One exact LA32 partial costs 77 DSP cycles per codec frame as a square
+   wave and 100 as a sawtooth**, against a budget of 489.40 per frame. After
+   the transport, the reverb and the block-rate control take their share,
+   that is four or five partials on the DSP — one or two timbres at a time,
+   not a nine-part module. A perceptual partial could reach about 60 cycles;
+   it cannot reach the 15 that thirty-two partials would need. See
    [`docs/la32-budget.md`](docs/la32-budget.md).
 2. **The PCM ROM does not fit and never will.** It is 262,144 samples against
    32,768 words of Falcon DSP SRAM. The proposed answer — the 68030 renders
    PCM partials and streams the result, exactly as F030MXDRV streams decoded
-   PDX ADPCM — is written down but not built or measured.
-3. **No oracle harness exists.** Munt is vendored under `third_party/munt`
-   as the intended reference implementation, but nothing compares against it
-   yet.
+   PDX ADPCM — is written down but not built or measured, and after the first
+   measurement it is the host's capacity that decides most of the machine.
+3. **The oracle harness exists for the wave generator only.** Munt is
+   vendored under `third_party/munt`; `tools/la32_partial_oracle.cpp` drives
+   its LA32 model and `tools/la32_partial.py` compares the DSP's output with
+   it word for word. Nothing compares envelopes, allocation or MIDI yet.
 
-Until those are answered, treat every architectural statement in `docs/` as a
-proposal with its evidence named, not as a description of working code.
+Treat every architectural statement in `docs/` as a proposal with its
+evidence named, not as a description of working code.
 
 ## Legal position on the ROMs
 
@@ -64,7 +72,8 @@ The supported build flow expects a POSIX shell plus:
 
 - Git with access to the two pinned submodules;
 - Python 3, `make`, `tar`, `file`, and `rg`;
-- a C++17 compiler once the Munt oracle harness exists;
+- a C++17 compiler for the Munt LA32 oracle, whose table dump the DSP
+  build derives its lookup tables from;
 - DOSBox Staging or DOSBox for Motorola's DSP assembler; and
 - Hatari for the emulator gates — the DSP-calibrated build described in
   [`docs/hatari-timing.md`](docs/hatari-timing.md), because stock Hatari runs
@@ -104,6 +113,9 @@ make check
 | `make all` | build the Falcon executable and the DSP image | DOSBox |
 | `make check` | build everything and validate the generated artefacts | DOSBox |
 | `make smoke` | score boot and transport under Hatari | Hatari |
+| `make oracle` | build the native Munt LA32 partial oracle | C++17 |
+| `make profile-partial CFG=n` | render configuration `n` (0-3) of one LA32 partial on the DSP, check it word for word against the oracle, and report its cycle cost | Hatari |
+| `make profile-partials` | the same for every configuration | Hatari |
 | `make verbose` | build the traced bring-up executable | DOSBox |
 | `make run` | launch the self-test executable in Hatari | Hatari |
 
@@ -133,7 +145,10 @@ F030MT32.TTP STREAM    hold the host-fed square wave until a keypress
 ```
 
 Only the first letter of the tail is examined, so `T` and `tone` also work and
-anything else falls back to the self-test.
+anything else falls back to the self-test. A one-digit `PROFILE.CFG` beside
+the program selects the LA32 profile spike for that configuration instead,
+which is how `make profile-partial` drives it: Hatari's autostart carries no
+command tail.
 
 Counters that stay at zero mean the SSI never clocked — the failure mode
 F030MXDRV chased onto real hardware and eventually traced to Port C pins left
@@ -162,11 +177,13 @@ layout, and the reasoning behind the split.
 The intended contracts, in the order they have to be established:
 
 1. **Transport.** Boot, handshake, codec cadence, and period handoff, scored
-   under Hatari by `make smoke`. This is the only contract the scaffold
-   currently exercises.
+   under Hatari by `make smoke`.
 2. **Feasibility.** Measured DSP cycles for one LA32 partial, the reverb, and
    the transport against the 489.40-cycle frame budget, before any synthesis
-   is committed to.
+   is committed to. The partial is measured: `make profile-partials` renders
+   four configurations, requires each to equal Munt's output word for word,
+   and reports 77 and 100 cycles per frame. The reverb and the transport are
+   not yet.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the
    production renderer — the same two-tier split F030MXDRV uses against
@@ -174,12 +191,17 @@ The intended contracts, in the order they have to be established:
 
 ## Repository map
 
-- `src/dsp/la32.asm`: scaffold DSP kernel — protocol, codec transport, test tone.
+- `src/dsp/la32.asm`: scaffold DSP kernel — protocol, codec transport, test
+  tone, and the bit-exact LA32 partial behind the profile spike.
 - `src/dsp/stage2_loader.asm`: sparse embedded P-memory loader.
 - `src/dsp/protocol.inc`, `src/m68k/protocol.i`: the one host/DSP contract in two syntaxes.
-- `src/m68k/main.s`: Falcon bootstrap, sound matrix, self-test and bring-up modes.
+- `src/m68k/main.s`: Falcon bootstrap, sound matrix, self-test, bring-up and profile modes.
 - `src/m68k/dsp_link.s`: paced host/DSP transfer.
-- `tools/`: DSP build driver, stage-two image generator, tone-table generator.
+- `tools/la32_partial_oracle.cpp`, `tools/la32_partial.py`: the Munt LA32
+  oracle, the DSP table and configuration generator, and the word-for-word
+  comparison; `tools/profile_dsp.py` drives Hatari's DSP profiler.
+- `tools/`: also the DSP build driver, stage-two image generator and
+  tone-table generator.
 - `docs/`: architecture, MT-32 and MIDI ground truth, DSP and emulator notes.
 - `tests/traces/`: fixture format for future MIDI conformance traces.
 

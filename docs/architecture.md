@@ -106,7 +106,9 @@ word on TXDE itself (`dsp_blast_paced`) rather than trusting the XBIOS call.
 F030MXDRV lost real hardware time to this; Hatari does not reproduce it,
 because its DSP has no host-port wait states.
 
-Opcodes `0a` upwards are unallocated and are where the synthesizer goes.
+Opcode `0a` is the LA32 profile spike (`MT32_CMD_PROFILE_PARTIAL`, see
+[`la32-budget.md`](la32-budget.md)); `0b` upwards are unallocated and are
+where the synthesizer goes.
 
 ## Boot
 
@@ -133,11 +135,15 @@ limit, non-P sections, and sections outside 16-bit P memory.
 | --- | --- | --- |
 | P | `$0000-$003f` | reset and interrupt vectors |
 | P | `$0040-$007f` | reserved for the transient stage-two loader |
-| P | `$0080-$03ff` | kernel |
-| P | `$0400-$04ff` | test-tone table image |
-| X | `$0000-$00ff` | internal: scalar transport state |
-| Y | `$0000-$00ff` | internal: the tone table, copied from P at boot |
-| X | `$1000-$13ff` | external: period buffer A |
+| P | `$0080-$01ff` | internal: the two LA32 partial render loops |
+| P | `$0200-$05ff` | external: command loop, transport, profile command |
+| P | `$0700-$07ff` | LA32 constant and configuration images |
+| P | `$0800-$08ff` | test-tone table image, aliased to `Y:$0800` |
+| P | `$3000-$35ff`, `$3600-$3a3f`, `$3c00-$3fff` | LA32 window, power and resonance tables, aliased to the same Y addresses |
+| P | `$4000-$4fff`, `$7000-$75ff` | LA32 exponent and square value tables, aliased to `X:$0000` and `X:$3000` |
+| X | `$0000-$00ff` | internal: first page of the exponent table, copied from P at boot |
+| Y | `$0000-$003f` | internal: scalar transport state, LA32 constants and configuration |
+| X | `$1000-$13ff` | external: period buffer A, and the profile spike's output |
 | X | `$1400-$17ff` | external: period buffer B |
 
 Two Falcon facts shape this and both are carried over from F030MXDRV rather
@@ -145,16 +151,20 @@ than rediscovered here:
 
 - **Initialized data can only be shipped in P.** The stage-two loader
   transports P sections; there is no X or Y record type. Anything that has to
-  start with a value either lives in P and is copied at boot (as the tone table
-  is), or is uploaded at runtime over the protocol (as F030MXDRV uploads its
-  ymfm tables). Uninitialized state uses `ds`, which emits nothing.
+  start with a value either lives in P and is copied at boot (as the LA32
+  constants are), or is uploaded at runtime over the protocol (as F030MXDRV
+  uploads its ymfm tables), or — the way every large LA32 table and the tone
+  table arrive — is assembled at the P address that aliases its X or Y home,
+  so the loader delivers it in place. Uninitialized state uses `ds`, which
+  emits nothing.
 - **External P, X and Y alias one 32K SRAM.** External P maps to the SRAM
   directly, external Y onto the same lower 16K word for word, and external X
   onto the upper 16K at `phys = addr + $4000`. Placing code and data in the
   same physical word is a silent corruption, not a build error, so the
   generator's overlap check is the only thing standing between a grown kernel
-  and a corrupted table. `docs/dsp56001-notes.md` records the probe that
-  should confirm the decode on real hardware before any of it is trusted.
+  and a corrupted table. F030MXDRV's bus probe confirmed the decode on a
+  physical Falcon on 2026-09-02 (`F030MXDRV/docs/hatari-timing.md`), which
+  is what makes the alias delivery above safe to rely on.
 
 ## The PCM ROM problem
 
@@ -233,6 +243,11 @@ Only this much runs:
 - frame and period counters, readable while audio is running;
 - Falcon sound-matrix setup and restoration on every exit path;
 - a Hatari smoke gate that scores the whole sequence from the emulator's own
-  host-port and XBIOS traces.
+  host-port and XBIOS traces;
+- one LA32 synth partial with block-held controls, bit-exact against Munt,
+  rendered on command into a buffer for the profiler and the oracle
+  comparison — a measurement, not a voice: it has no envelopes, no pitch
+  updates, no allocation, and it never reaches the codec.
 
-No LA32, no MIDI, no ROM handling, no oracle.
+No MIDI, no ROM handling, no envelopes, and no oracle beyond the wave
+generator.

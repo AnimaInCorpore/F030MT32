@@ -17,6 +17,17 @@ MT32_CMD_STOP_AUDIO equ     $070000 ; halt SSI, return to the command loop
 MT32_CMD_QUERY_TIME equ     $080000 ; -> codec frames emitted, modulo 2^24
 MT32_CMD_QUERY_PERIODS equ  $090000 ; -> completed period handoffs
 
+; Feasibility spike: render LA32_PROFILE_FRAMES frames of one LA32 synth
+; partial, bit-exact against Munt's integer model with amp, pitch and cutoff
+; held constant, into DSP X:$1000 and reply with the buffer's fold
+; h = (2h + word) mod 2^24. The low byte selects one of the configurations
+; tools/la32_partial.py defines; the same byte on a PING is the marker the
+; Hatari cycle profiler arms on. See docs/la32-budget.md.
+MT32_CMD_PROFILE_PARTIAL equ $0a0000
+MT32_PROFILE_MARKER equ     $01c000
+LA32_PROFILE_FRAMES equ     2048
+LA32_PROFILE_CONFIGS equ    4
+
 ; One transport period. 512 stereo frames at the 32,779.947916 Hz codec rate
 ; is 15.62 ms, the same cadence F030MXDRV's production path was calibrated
 ; against; the interleaved buffer is therefore 1024 words and must sit on a

@@ -31,6 +31,7 @@ SNDSTAT_RESET   equ     1
 MODE_SELFTEST   equ     0
 MODE_TONE       equ     1
 MODE_STREAM     equ     2
+MODE_PROFILE    equ     3
 
 ; Self-test durations. Long enough that a stalled SSI clock is unmistakable in
 ; the frame counter, short enough for a non-interactive emulator run.
@@ -54,6 +55,10 @@ start:
         movea.l 4(sp),a0                ; TOS basepage at process entry
         lea     $80(a0),a0              ; length-prefixed command tail
         bsr     parse_tail
+        cmpi.l  #MODE_SELFTEST,d0
+        bne.s   start_mode_known
+        bsr     read_profile_cfg        ; a PROFILE.CFG beside the program
+start_mode_known:                       ; selects the LA32 profile spike
         move.l  d0,run_mode
 
         VB      vb_txt_reserve
@@ -86,6 +91,12 @@ start:
         cmp.l   #MT32_REPLY_HELLO,d0
         bne     protocol_failed
         Cconws  dsp_ready_text
+
+        ; The profile spike never touches the codec, so it runs before the
+        ; sound matrix is claimed and exits without restoring anything.
+        move.l  run_mode,d0
+        cmpi.l  #MODE_PROFILE,d0
+        beq     dispatch_profile
 
         bsr     sound_open
         tst.l   d0
@@ -124,6 +135,65 @@ clean_exit:
         bsr     sound_close
         Cconws  done_text
         Pterm0
+
+dispatch_profile:
+        bsr     run_profile
+        tst.l   d0
+        bne     profile_failed
+        Cconws  done_text
+        Pterm0
+
+; -----------------------------------------------------------------------------
+; LA32 profile spike
+; -----------------------------------------------------------------------------
+
+; Arm the Hatari cycle profiler with a PING whose payload names the
+; configuration, then have the DSP render that configuration and print the
+; checksum it folded from its output buffer. tools/la32_partial.py checks
+; the buffer itself against the Munt oracle from the emulator's memory dump.
+; out: d0.l = 0 on success
+run_profile:
+        move.l  #MT32_PROFILE_MARKER,d0
+        or.l    profile_cfg,d0
+        bsr     dsp_exchange
+        cmp.l   #MT32_REPLY_HELLO,d0
+        bne.s   run_profile_failed
+        move.l  #MT32_CMD_PROFILE_PARTIAL,d0
+        or.l    profile_cfg,d0
+        bsr     dsp_exchange
+        lea     txt_profile_checksum,a0
+        bsr     report_value
+        moveq   #0,d0
+        rts
+run_profile_failed:
+        moveq   #-1,d0
+        rts
+
+; Hatari's autostart cannot pass a command tail, so a one-digit PROFILE.CFG
+; beside the program selects the spike the way F030MXDRV's AUTOPLAY.INF
+; selects a song. Absent, unreadable or out of range means the self-test.
+; out: d0.l = MODE_PROFILE with profile_cfg set, or MODE_SELFTEST
+read_profile_cfg:
+        Fopen   profile_cfg_name,#0
+        tst.l   d0
+        bmi.s   read_profile_cfg_none
+        move.w  d0,d7                   ; handle; GEMDOS preserves d3-d7
+        Fread   d7,#1,profile_cfg_byte
+        move.l  d0,d6
+        Fclose  d7
+        subq.l  #1,d6
+        bne.s   read_profile_cfg_none
+        moveq   #0,d0
+        move.b  profile_cfg_byte,d0
+        subi.b  #'0',d0
+        cmpi.b  #LA32_PROFILE_CONFIGS-1,d0
+        bhi.s   read_profile_cfg_none
+        move.l  d0,profile_cfg
+        moveq   #MODE_PROFILE,d0
+        rts
+read_profile_cfg_none:
+        moveq   #MODE_SELFTEST,d0
+        rts
 
 ; -----------------------------------------------------------------------------
 ; Sources
@@ -444,6 +514,9 @@ sound_failed:
         bra.s   fail_exit
 audio_failed:
         Cconws  audio_error_text
+        bra.s   fail_exit
+profile_failed:
+        Cconws  profile_error_text
 fail_exit:
         bsr     sound_close
         move.w  #1,-(sp)
@@ -522,6 +595,10 @@ txt_tone_periods:
         dc.b    'tone periods       ',0
 txt_stream_periods:
         dc.b    'stream periods     ',0
+txt_profile_checksum:
+        dc.b    'partial checksum   ',0
+profile_cfg_name:
+        dc.b    'PROFILE.CFG',0
 reserve_error_text:
         dc.b    'Dsp_Reserve failed',13,10,0
 load_error_text:
@@ -532,6 +609,8 @@ sound_error_text:
         dc.b    'sound system is locked by another program',13,10,0
 audio_error_text:
         dc.b    'audio transport failed',13,10,0
+profile_error_text:
+        dc.b    'LA32 profile spike failed',13,10,0
         even
 
 ; The generated DSP image closes the data section, as in F030MXDRV. A TOS
@@ -550,6 +629,11 @@ dsp_stage2_reply:
         ds.l    1
 host_phase:
         ds.l    1
+profile_cfg:
+        ds.l    1
+profile_cfg_byte:
+        ds.b    1
+        even
 old_left_atten:
         ds.w    1
 old_right_atten:

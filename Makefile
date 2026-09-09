@@ -29,6 +29,17 @@ ROMS_DIR ?= roms
 DSP_STAGE2_IMAGE := $(GENERATED_BUILD)/dsp_stage2_image.i
 TONE_TABLE := $(GENERATED_BUILD)/tone_table.inc
 
+# LA32 profile spike: the native Munt oracle, the tables it dumps, and the
+# DSP-side table image derived from them (see tools/la32_partial.py).
+NATIVE_BUILD := build/native
+MUNT_SRC := third_party/munt/mt32emu/src
+LA32_ORACLE := $(NATIVE_BUILD)/la32_partial_oracle.exe
+LA32_TABLE_DUMP := $(GENERATED_BUILD)/la32_tables.txt
+LA32_TABLES := $(GENERATED_BUILD)/la32tabs.inc
+LA32_PROFILE_DIR := build/la32-profile
+LA32_REFERENCE_DIR := build/reference
+CXX ?= g++
+
 M68K_SOURCES := \
 	src/m68k/main.s \
 	src/m68k/dsp_link.s
@@ -78,7 +89,8 @@ endef
 
 DOSBOX_FLAGS ?= --noprimaryconf --set output=texture
 
-.PHONY: all help host dsp reference check smoke run verbose clean tools
+.PHONY: all help host dsp reference check smoke run verbose clean tools \
+	oracle profile-partial profile-partials
 
 all: host dsp
 
@@ -89,10 +101,17 @@ help:
 	@echo "  smoke      run the non-interactive Hatari integration test"
 	@echo "  run        launch the self-test executable in Hatari"
 	@echo "  verbose    build the traced bring-up executable (mt32verb.tos)"
+	@echo "  oracle     build the native Munt LA32 partial oracle"
+	@echo "  profile-partial CFG=n"
+	@echo "             profile one LA32 synth partial under Hatari and check"
+	@echo "             its output against the oracle (configurations 0-3)"
+	@echo "  profile-partials"
+	@echo "             the same for every configuration"
 	@echo "  clean      remove generated build/ and release/ directories"
 	@echo
-	@echo "The DSP step needs DOSBox for Motorola's ASM56000; the Hatari"
-	@echo "targets need the DSP-calibrated build - see docs/hatari-timing.md."
+	@echo "The DSP step needs DOSBox for Motorola's ASM56000 and a C++17"
+	@echo "compiler for the oracle; the Hatari targets need the DSP-calibrated"
+	@echo "build - see docs/hatari-timing.md."
 	@echo
 	@echo "MT-32 ROM images are never tracked here. Put them in $(ROMS_DIR)"
 	@echo "(override with ROMS_DIR=path); see docs/mt32-ground-truth.md."
@@ -101,7 +120,9 @@ host: $(RELEASE_DIR)/f030mt32.tos $(RELEASE_DIR)/f030mt32.ttp
 
 dsp: $(RELEASE_DIR)/la32.lod $(DSP_STAGE2_IMAGE)
 
-reference: $(TONE_TABLE)
+reference: $(TONE_TABLE) $(LA32_TABLES)
+
+oracle: $(LA32_ORACLE)
 
 tools: $(VASM) $(VLINK)
 
@@ -135,18 +156,39 @@ $(TONE_TABLE): tools/generate_tone_table.py src/dsp/protocol.inc
 		--entries $$(sed -n 's/^TONE_TABLE_WORDS *equ *\([0-9]*\).*/\1/p' \
 			src/dsp/protocol.inc) > $@
 
+# The oracle links Munt's integer LA32 wave generator and its tables
+# directly; the tiny config.h stand-in spares a CMake configure of the
+# whole library. LGPL code, build-time only, nothing of it reaches the Falcon.
+$(LA32_ORACLE): tools/la32_partial_oracle.cpp tools/mt32emu_config/config.h \
+		$(MUNT_SRC)/LA32WaveGenerator.cpp $(MUNT_SRC)/LA32WaveGenerator.h \
+		$(MUNT_SRC)/Tables.cpp $(MUNT_SRC)/Tables.h
+	@mkdir -p $(NATIVE_BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++17 -O2 \
+		-Itools/mt32emu_config -I$(MUNT_SRC) \
+		tools/la32_partial_oracle.cpp $(MUNT_SRC)/LA32WaveGenerator.cpp \
+		$(MUNT_SRC)/Tables.cpp -o $@
+
+$(LA32_TABLE_DUMP): $(LA32_ORACLE)
+	@mkdir -p $(GENERATED_BUILD)
+	$(LA32_ORACLE) --dump-tables > $@
+
+$(LA32_TABLES): tools/la32_partial.py $(LA32_TABLE_DUMP)
+	python3 tools/la32_partial.py tables --tables $(LA32_TABLE_DUMP) > $@
+
 # -----------------------------------------------------------------------------
 # DSP
 # -----------------------------------------------------------------------------
 
 $(DSP_BUILD)/BUILD.BAT: tools/BUILD_DSP.BAT src/dsp/la32.asm \
-		src/dsp/stage2_loader.asm src/dsp/protocol.inc $(TONE_TABLE)
+		src/dsp/stage2_loader.asm src/dsp/protocol.inc $(TONE_TABLE) \
+		$(LA32_TABLES)
 	@mkdir -p $(DSP_BUILD)
 	cp tools/BUILD_DSP.BAT $(DSP_BUILD)/BUILD.BAT
 	cp src/dsp/la32.asm $(DSP_BUILD)/LA32.ASM
 	cp src/dsp/protocol.inc $(DSP_BUILD)/
 	cp src/dsp/stage2_loader.asm $(DSP_BUILD)/LA32BOOT.ASM
 	cp $(TONE_TABLE) $(DSP_BUILD)/tonetabs.inc
+	cp $(LA32_TABLES) $(DSP_BUILD)/la32tabs.inc
 	cp $(DSP_TOOL_SOURCE)/ASM56000.EXE $(DSP_TOOL_SOURCE)/CLDLOD.EXE \
 		$(DSP_TOOL_SOURCE)/DOS4GW.EXE $(DSP_TOOL_SOURCE)/ioequ.inc $(DSP_BUILD)/
 	@touch $@
@@ -168,11 +210,12 @@ $(RELEASE_DIR)/la32.lod: $(DSP_BUILD)/.assembled
 	@mkdir -p $(RELEASE_DIR)
 	cp $(DSP_BUILD)/LA32.LOD $@
 
-# The kernel occupies P:$0080-$03ff and the tone table P:$0400 upwards. There
-# is no reserved-table region and no free-island exception yet, so the plain
-# program limit is the whole of P below the external-Y reservation; the
-# generator still refuses overlapping sections, which is what catches a kernel
-# that grows into its own table.
+# The LA32 render loops occupy internal P:$0080-$01ff, the rest of the kernel
+# P:$0200-$05ff, the small LA32 images P:$0700, and the tone table and the
+# large LA32 tables sit at the P alias of their X/Y homes ($0800, $3000,
+# $3600, $3c00, $4000, $7000). There is no reserved-table region and no
+# free-island exception yet; the generator still refuses overlapping
+# sections, which is what catches a kernel that grows into its own tables.
 $(DSP_STAGE2_IMAGE): tools/generate_dsp_stage2.py $(DSP_BUILD)/.assembled
 	@mkdir -p $(GENERATED_BUILD)
 	python3 tools/generate_dsp_stage2.py \
@@ -231,6 +274,8 @@ check: all reference
 	@rg -q "^DSP_BOOT_WORDS equ " $(DSP_STAGE2_IMAGE)
 	@rg -q "^DSP_STAGE2_PROGRAM_WORDS equ " $(DSP_STAGE2_IMAGE)
 	@rg -q "^tone_table_image:" $(TONE_TABLE)
+	@rg -q "^la32_cfg_image:" $(LA32_TABLES)
+	@rg -q "^la32_unlog_image:" $(LA32_TABLES)
 	# The two protocol headers are one contract in two syntaxes; only their
 	# first line, which names the other file, may differ. Spelled without
 	# process substitution so the recipe works under a plain /bin/sh.
@@ -279,6 +324,68 @@ smoke: check
 	@! rg -q "Modulo addressing result unpredictable|Illegal instruction" \
 		build/hatari-smoke.log
 	@echo "Hatari F030MT32 boot and transport smoke test: OK"
+
+# Profile one LA32 synth partial: the 68030 arms the Hatari DSP profiler
+# with a marker PING, the DSP renders configuration CFG, the debugger
+# brackets the render loop and dumps the output buffer, and the Python tool
+# compares that buffer with the Munt oracle word for word before the cycle
+# report is trusted. The configuration reaches the program through
+# PROFILE.CFG because Hatari's autostart carries no command tail.
+LA32_PROFILE_RUN = $(LA32_PROFILE_DIR)/$(CFG)
+LA32_PROFILE_REFERENCE = $(LA32_REFERENCE_DIR)/la32-partial-$(CFG).txt
+
+profile-partial: check tools/profile_dsp.py tools/la32_partial.py
+	$(call require_hatari,profile-partial)
+	@test -n "$(CFG)" || { echo "error: profile-partial needs CFG=0..3" >&2; exit 1; }
+	@rm -rf $(LA32_PROFILE_RUN)
+	@mkdir -p $(LA32_PROFILE_RUN) $(LA32_REFERENCE_DIR)
+	@$(LA32_ORACLE) $$(python3 tools/la32_partial.py oracle-args $(CFG)) \
+		> $(LA32_PROFILE_REFERENCE)
+	@python3 tools/profile_dsp.py prepare \
+		--listing $(DSP_BUILD)/LA32.LST \
+		--output-dir $(LA32_PROFILE_RUN) \
+		--marker $$((0x01c000 + $(CFG))) \
+		--start-symbol la32_$$(python3 tools/la32_partial.py loop $(CFG))_loop \
+		--end-symbol la32_$$(python3 tools/la32_partial.py loop $(CFG))_done \
+		--marker-space y --dump x:0x1000-0x1fff
+	@printf '$(CFG)' > $(RELEASE_DIR)/PROFILE.CFG
+	@cd $(RELEASE_DIR) && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(HATARI) \
+		--machine falcon --dsp emu \
+		--tos $(CURDIR)/$(TOS_ROM) --patch-tos true \
+		--fast-boot true --fast-forward true --sound off \
+		--confirm-quit false --run-vbls 1200 \
+		--trace-file $(CURDIR)/$(LA32_PROFILE_RUN)/trace.txt \
+		--trace dsp_host_interface \
+		--parse $(CURDIR)/$(LA32_PROFILE_RUN)/start.ini \
+		f030mt32.tos \
+		> $(CURDIR)/$(LA32_PROFILE_RUN)/debug.log 2>&1 || { \
+			rm -f $(RELEASE_DIR)/PROFILE.CFG; \
+			tail -n 60 $(CURDIR)/$(LA32_PROFILE_RUN)/debug.log >&2; \
+			exit 1; \
+		}
+	@rm -f $(RELEASE_DIR)/PROFILE.CFG
+	@test -s $(LA32_PROFILE_RUN)/profile.txt || { \
+		echo "error: Hatari did not capture the LA32 partial profile" >&2; \
+		tail -n 60 $(LA32_PROFILE_RUN)/debug.log >&2; \
+		exit 1; \
+	}
+	@python3 tools/la32_partial.py compare \
+		--dump $(LA32_PROFILE_RUN)/debug.log \
+		--oracle $(LA32_PROFILE_REFERENCE) $(CFG)
+	@rg -q "Transfer 0x$$(python3 tools/la32_partial.py expected-checksum \
+		--oracle $(LA32_PROFILE_REFERENCE))" $(LA32_PROFILE_RUN)/trace.txt
+	@python3 tools/profile_dsp.py report \
+		--listing $(DSP_BUILD)/LA32.LST \
+		--profile $(LA32_PROFILE_RUN)/profile.txt \
+		--output $(LA32_PROFILE_RUN)/report.txt \
+		--samples 2048 --sample-rate 32779.947916 \
+		--unit-label "codec frame" \
+		--title "DSP56001 LA32 synth partial, configuration $(CFG) ($$(python3 tools/la32_partial.py name $(CFG)))"
+
+profile-partials:
+	@for cfg in $$(seq 0 $$(( $$(python3 tools/la32_partial.py count) - 1 ))); do \
+		$(MAKE) --no-print-directory profile-partial CFG=$$cfg || exit 1; \
+	done
 
 run: all
 	$(call require_hatari,run)
