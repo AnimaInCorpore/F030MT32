@@ -135,16 +135,23 @@ limit, non-P sections, and sections outside 16-bit P memory.
 | --- | --- | --- |
 | P | `$0000-$003f` | reset and interrupt vectors |
 | P | `$0040-$007f` | reserved for the transient stage-two loader |
-| P | `$0080-$01ff` | internal: the four LA32 partial render loops |
+| P | `$0080-$01ff` | internal: the four LA32 partial render loops, or the reverb loop in the reverb image |
 | P | `$0200-$05ff` | external: command loop, transport, profile command |
 | P | `$0700-$07ff` | LA32 constant and run configuration images |
 | P | `$0800-$08ff` | test-tone table image, aliased to `Y:$0800` |
 | P | `$0900-$3bff` | LA32 Y tables — gain, resonance, windows, signed sine — aliased to the same Y addresses |
 | P | `$4000-$4fff`, `$6000-$783f` | LA32 X tables — exponent, square values, cosine, power — aliased to `X:$0000` and `X:$2000` upwards |
+| P | `$5000-$5fff` | reverb image only: the input frames, aliased to `X:$1000` |
 | X | `$0000-$00ff` | internal: first page of the exponent table, copied from P at boot |
-| Y | `$0000-$003f` | internal: scalar transport state, LA32 constants and configuration |
-| X | `$1000-$13ff` | external: period buffer A, and the profile spike's output |
+| Y | `$0000-$003f` | internal: scalar transport state, LA32 or reverb constants and configuration |
+| Y | `$0c00-$3ed8` | reverb image only: the seven delay lines, each in a power-of-two-aligned block for modulo addressing |
+| X | `$1000-$13ff` | external: period buffer A, and the profile spikes' output |
 | X | `$1400-$17ff` | external: period buffer B |
+
+The two profile images share this source and this map; the host embeds
+both and boots the one a run needs, because the partial loops and the reverb
+loop do not fit internal P together and the reverb's lines need the space
+the partial tables take.
 
 Two Falcon facts shape this and both are carried over from F030MXDRV rather
 than rediscovered here:
@@ -248,7 +255,10 @@ Only this much runs:
   bit-exact against Munt and one perceptual within a few output words of it,
   rendered on command into a buffer for the profiler and the oracle
   comparison — a measurement, not a voice: it has no envelopes, no pitch
-  updates, no allocation, and it never reaches the codec.
+  updates, no allocation, and it never reaches the codec;
+- the Boss reverb in the MT-32's room mode, bit-exact against Munt, run on
+  command over a buffer of input frames in a second DSP image — again a
+  measurement: it processes a fixed buffer, not the codec stream.
 
 No MIDI, no ROM handling, no envelopes, and no oracle beyond the wave
-generator.
+generator and the reverb.

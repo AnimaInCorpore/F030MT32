@@ -24,7 +24,12 @@
 ; their fetches never contend with the external table reads; the transport
 ; moved to external P:$0200 to make room, and its scalar state moved to
 ; internal Y because internal X now holds the first page of the exact
-; kernel's unlog table. See docs/la32-budget.md for the measurements.
+; kernel's unlog table.
+;
+; Assembled with LA32_REVERB_IMAGE defined (src/dsp/reverb.asm), the same
+; source becomes the reverb profile image: the partial loops and tables give
+; way to the Boss reverb loop, its delay lines, and the input frames it
+; processes in place. See docs/la32-budget.md for the measurements.
 
         include 'ioequ.inc'
         include 'protocol.inc'
@@ -43,6 +48,27 @@ LA32_CONST_WORDS    equ     21
 LA32_CONFIG_WORDS   equ     18
 LA32_OUTPUT_BASE    equ     $1000
 LA32_OUTPUT_WORDS   equ     2*LA32_PROFILE_FRAMES
+
+; Boss reverb, MT-32 room mode: delay-line homes in Y (mirrored by the
+; Python tool, which checks each base is aligned to the power of two above
+; the line's length, as modulo addressing requires) and the fixed tap
+; distances behind each comb's write position.
+RV_ENT_BASE         equ     $0c00
+RV_ENT_SIZE         equ     576
+RV_AP0_BASE         equ     $3800
+RV_AP0_SIZE         equ     994
+RV_AP1_BASE         equ     $3c00
+RV_AP1_SIZE         equ     729
+RV_AP2_BASE         equ     $0f00
+RV_AP2_SIZE         equ     78
+RV_COMB1_BASE       equ     $3000
+RV_COMB1_SIZE       equ     2040
+RV_COMB2_BASE       equ     $2000
+RV_COMB2_SIZE       equ     2752
+RV_COMB3_BASE       equ     $1000
+RV_COMB3_SIZE       equ     3629
+RV_TAP_R1           equ     -1019
+RV_TAP_L3           equ     -1814
 
 ; -----------------------------------------------------------------------------
 ; Bootstrap and interrupt vectors
@@ -86,6 +112,34 @@ tone_phase:
         ds      1                       ; 16-bit accumulator
 tone_step:
         ds      1                       ; 16-bit phase increment per frame
+
+        IF      @DEF(LA32_REVERB_IMAGE)
+
+; Reverb image: the run's constants, copied from the configuration image by
+; command_profile, and two scratch words. Word 8 is the kernel selector the
+; partial image also reads, so both images share one image layout.
+        org     y:$10
+rv_input        ds      1               ; the partial run whose frames are the input
+rv_fb1          ds      1               ; comb feedback factors << 15
+rv_fb2          ds      1
+rv_fb3          ds      1
+rv_dry          ds      1               ; dry amp << 15
+rv_wet          ds      1               ; wet level << 15
+rv_ffent        ds      1               ; entrance low-pass factor << 15
+rv_lpf          ds      1               ; entrance output amp << 15
+rv_kernel       ds      1               ; 2
+rv_ffc          ds      1               ; comb filter factor << 15
+rv_n5l          ds      1               ; comb 2 left tap offset
+rv_n5r          ds      1               ; comb 2 right tap offset
+rv_max          ds      1               ; 32767
+rv_min          ds      1               ; -32768
+rv_quarter      ds      1               ; 2^21: mpy by it is a right shift by 2
+rv_half         ds      1               ; 2^22: mpy by it is a right shift by 1
+rv_pad          ds      2
+rv_outl1        ds      1               ; scratch: comb 1's oldest word
+rv_outr3        ds      1               ; scratch: comb 3's last word
+
+        ELSE
 
 ; LA32 partial state, fixed constants and the active run's configuration, all
 ; within the 6-bit short-absolute range so the loops load them for free
@@ -133,6 +187,8 @@ la_half1        ds      4               ;   decay << 15, square sign multiplier;
                                         ; perceptual: linear length, sine table base,
                                         ;   decay << 15, signed square gain
 
+        ENDIF
+
 ; The 256-entry test-tone table is external Y data now, delivered by the P
 ; alias like the LA32 tables, so the boot no longer copies it.
         org     y:$800
@@ -142,8 +198,8 @@ tone_sine:
 ; Two interleaved stereo periods in external X. Both bases are 1024-word
 ; aligned because the SSI output pointer runs modulo MT32_PERIOD_MODULO, and
 ; ds keeps them out of the loader image. External X decodes at phys+$4000 on
-; the Falcon, clear of the P/Y alias in the lower 16K. The profile spike
-; reuses X:$1000-$1fff as its output buffer while no audio runs.
+; the Falcon, clear of the P/Y alias in the lower 16K. The profile spikes
+; reuse X:$1000-$1fff as their output buffer while no audio runs.
         org     x:$1000
 ssi_buffer_a:
         ds      MT32_PERIOD_WORDS
@@ -151,6 +207,146 @@ ssi_buffer_a:
         org     x:$1400
 ssi_buffer_b:
         ds      MT32_PERIOD_WORDS
+
+        IF      @DEF(LA32_REVERB_IMAGE)
+
+; -----------------------------------------------------------------------------
+; Boss reverb, one frame per iteration (internal P)
+; -----------------------------------------------------------------------------
+;
+; Munt's BReverbModel, MT-32 room mode, integer renderer, in its default
+; non-precise form:
+;
+;   dry  = ((inL >> 2) + (inR >> 2)) * dryAmp >> 8
+;   entrance delay (576): link = oldest; new = ((last * $b0 >> 8) + dry) * $80 >> 8
+;   three allpasses: new = link - (oldest >> 1); link = oldest + (new >> 1)
+;   three combs: new = (last * $60 >> 8) - (link + (oldest * feedback >> 8))
+;   outL = clip(c1[old] + c1[old]>>1 + c2[-687] + c2[-687]>>1 + c3[-1814])
+;   outR = clip(c1[-1019] + ... + c2[-2072] + ... + c3[-1]),  wet = out * level >> 8
+;
+; where "last" is the word at a line's index, "oldest" the word after it,
+; which the frame overwrites, and the taps are distances behind the new
+; index. Every line is a modulo pointer: r0 entrance, r1-r3 allpasses at
+; their next slot, r4/r5/r7 combs at their index, r6 the in-place stereo
+; buffer. The tap reads use post-update addressing twice - forward by the
+; offset and back - so they cost plain moves rather than indexed ones; comb
+; 2 has two taps and reloads n5 between them. weirdMul is a fractional
+; multiply by the factor << 15 and halving one by 2^22, both exact floors.
+
+        org     p:$80
+
+la32_reverb_run:
+        do      #LA32_PROFILE_FRAMES,la32_reverb_done
+la32_reverb_loop:
+; dry input
+        move    y:<rv_quarter,y0
+        move    x:(r6)+,x0                  ; left
+        mpy     x0,y0,a   x:(r6)-,x1        ; a1 = left >> 2; x1 = right; r6 back to the left slot
+        mpy     x1,y0,b   y:<rv_dry,y1      ; b1 = right >> 2
+        move    a1,x0
+        add     x0,b      y:<rv_ffent,y0
+        move    b1,x0
+        mpy     x0,y1,a   y:(r0)+,x0        ; a1 = dry; x0 = entrance last; r0 -> oldest
+        move    a1,y1                       ; y1 = dry
+; entrance delay with its low-pass filter; the oldest word is the link
+        mpy     x0,y0,a   y:(r0),x1         ; a1 = last * $b0 >> 8; x1 = link
+        add     y1,a      y:<rv_lpf,y0
+        move    a1,x0
+        mpy     x0,y0,a   y:<rv_half,y0     ; a1 = new; y0 = half for the allpasses
+        move    a1,y:(r0)
+; allpass 0; the link travels in a from one allpass to the next
+        tfr     x1,b      y:(r1),x0         ; b = link; x0 = oldest
+        mpy     x0,y0,a                     ; a1 = oldest >> 1
+        move    a1,y1
+        sub     y1,b                        ; b1 = new
+        move    b1,x1
+        mpy     x1,y0,a   b,y:(r1)+         ; a1 = new >> 1; store, advance
+        add     x0,a                        ; a1 = link
+; allpass 1
+        tfr     a,b       y:(r2),x0
+        mpy     x0,y0,a
+        move    a1,y1
+        sub     y1,b
+        move    b1,x1
+        mpy     x1,y0,a   b,y:(r2)+
+        add     x0,a
+; allpass 2; the first comb's feedback factor rides on its last add
+        tfr     a,b       y:(r3),x0
+        mpy     x0,y0,a
+        move    a1,y1
+        sub     y1,b
+        move    b1,x1
+        mpy     x1,y0,a   b,y:(r3)+
+        add     x0,a      y:<rv_fb1,y0
+        move    a1,x1                       ; x1 = link into the combs
+; comb 1; its oldest word is the first left tap
+        move    y:(r4)+,x0                  ; last; r4 -> oldest
+        move    y:(r4),y1                   ; oldest
+        mpy     y1,y0,a   y:<rv_ffc,y0      ; a1 = oldest * feedback >> 8
+        add     x1,a      y1,y:<rv_outl1    ; a1 = filter input; keep the tap
+        mpy     x0,y0,b   y:<rv_fb2,y0      ; b1 = last * $60 >> 8; next feedback
+        move    a1,y1
+        sub     y1,b                        ; b1 = new
+        move    b,y:(r4)                    ; store at the new index
+; comb 2
+        move    y:(r5)+,x0
+        move    y:(r5),y1
+        mpy     y1,y0,a   y:<rv_ffc,y0
+        add     x1,a
+        mpy     x0,y0,b   y:<rv_fb3,y0
+        move    a1,y1
+        sub     y1,b
+        move    b,y:(r5)
+; comb 3; its last word is the third right tap, and half is next
+        move    y:(r7)+,x0
+        move    y:(r7),y1
+        mpy     y1,y0,a   y:<rv_ffc,y0
+        add     x1,a      x0,y:<rv_outr3
+        mpy     x0,y0,b   y:<rv_half,y0
+        move    a1,y1
+        sub     y1,b
+        move    b,y:(r7)
+; left output: 1.5 * comb 1's oldest + 1.5 * comb 2's tap + comb 3's tap,
+; clipped and scaled by the wet level. A tap is read by stepping the comb's
+; pointer forward by the offset and back, two plain moves that ride on the
+; transfers and multiply-accumulates of the mix.
+        move    y:<rv_outl1,x0
+        tfr     x0,a      y:(r5)+n5,x1      ; a = tap 1; comb 2 to its left tap
+        mac     x0,y0,a   y:(r5)-n5,x1      ; a1 = tap 1 + tap 1 >> 1; x1 = tap 2; back
+        tfr     x1,b      y:(r7)+n7,y1      ; b = tap 2; comb 3 to its left tap
+        mac     x1,y0,b   y:(r7)-n7,y1      ; b1 = tap 2 + tap 2 >> 1; y1 = tap 3; back
+        move    b1,x1
+        add     x1,a      y:<rv_max,x0
+        add     y1,a      y:<rv_min,x1
+        cmp     x0,a
+        tgt     x0,a
+        cmp     x1,a      y:<rv_wet,y1
+        tlt     x1,a
+        move    a1,x0
+        mpy     x0,y1,a   y:(r4)+n4,x1      ; a1 = wet left; comb 1 to its right tap
+        move    a1,x:(r6)+                  ; over the input
+; right output: comb 1's tap, comb 2's second tap, comb 3's last word
+        move    y:(r4)-n4,x0                ; x0 = tap 1; back
+        move    y:<rv_n5r,n5
+        tfr     x0,a      y:<rv_outr3,y1    ; a = tap 1; y1 = tap 3
+        mac     x0,y0,a   y:(r5)+n5,x1      ; a1 = 1.5 * tap 1; comb 2 to its right tap
+        move    y:(r5)-n5,x1                ; x1 = tap 2; back
+        tfr     x1,b      y:<rv_n5l,n5      ; b = tap 2; the left offset again
+        mac     x1,y0,b                     ; b1 = 1.5 * tap 2
+        move    b1,x1
+        add     x1,a      y:<rv_max,x0
+        add     y1,a      y:<rv_min,x1
+        cmp     x0,a
+        tgt     x0,a
+        cmp     x1,a      y:<rv_wet,y1
+        tlt     x1,a
+        move    a1,x0
+        mpy     x0,y1,a
+        move    a1,x:(r6)+                  ; wet right over the input
+la32_reverb_done:
+        rts
+
+        ELSE
 
 ; -----------------------------------------------------------------------------
 ; LA32 synth partial, one frame per iteration (internal P)
@@ -537,6 +733,8 @@ la32_psaw_loop:
 la32_psaw_done:
         rts
 
+        ENDIF
+
 ; -----------------------------------------------------------------------------
 ; Kernel (external P; the transport is not cycle-critical)
 ; -----------------------------------------------------------------------------
@@ -607,6 +805,7 @@ command_loop:
         cmp     x0,a
         jeq     command_profile
 
+command_unknown:
         move    #>MT32_REPLY_ERROR,a
         jsr     send_reply
         jmp     command_loop
@@ -644,17 +843,16 @@ command_query_periods:
         jmp     command_loop
 
 ; -----------------------------------------------------------------------------
-; LA32 profile spike: MT32_CMD_PROFILE_PARTIAL
+; Profile spike: MT32_CMD_PROFILE_PARTIAL
 ; -----------------------------------------------------------------------------
 
-; Install the selected run's configuration, clear the output buffer, render
-; with the kernel and wave the configuration names, fold the buffer into a
-; checksum and reply with it. The render loops carry the profiler's start
-; and end labels; everything here is outside the bracket.
-command_profile:
-        move    y:last_command,a
-        move    #>$0000ff,x0
-        and     x0,a
+; Install the selected run's configuration block over the kernel's
+; configuration words, then render, fold the output buffer into a checksum
+; and reply with it. The render loops carry the profiler's start and end
+; labels; everything here is outside the bracket.
+; in:  a1 = run index
+; out: r1 = the configuration block, r0 = past its image
+profile_install:
         move    a1,b
         rep     #4
         asl     b                       ; run index * 16 ...
@@ -663,11 +861,117 @@ command_profile:
         move    #>la32_cfg_image,x0
         add     x0,b
         move    b1,r0
+        IF      @DEF(LA32_REVERB_IMAGE)
+        move    #<rv_input,r1
+        ELSE
         move    #<la_step3,r1
-        do      #LA32_CONFIG_WORDS,command_profile_installed
+        ENDIF
+        do      #LA32_CONFIG_WORDS,profile_installed
         move    p:(r0)+,x0
         move    x0,y:(r1)+
-command_profile_installed:
+profile_installed:
+        rts
+
+; Fold the output buffer into the reply checksum, h = (2h + word) mod 2^24.
+profile_fold:
+        move    #>LA32_OUTPUT_BASE,r6
+        move    #>LA32_OUTPUT_WORDS,x0
+        clr     a
+        do      x0,profile_folded
+        move    x:(r6)+,x1
+        asl     a
+        add     x1,a
+profile_folded:
+        rts
+
+        IF      @DEF(LA32_REVERB_IMAGE)
+
+; Reverb image: the input frames are already in X:$1000, delivered by the P
+; alias; clear the delay lines, point every modulo register at its line and
+; run the loop over the buffer in place.
+command_profile:
+        move    y:last_command,a
+        move    #>$0000ff,x0
+        and     x0,a
+        jsr     profile_install
+        move    y:<rv_kernel,a
+        move    #>2,x0
+        cmp     x0,a
+        jne     command_unknown
+        jsr     reverb_prepare
+        jsr     la32_reverb_run
+        jsr     profile_fold
+        jsr     send_reply
+        jmp     command_loop
+
+; Silence the seven lines, then set the pointers as Munt's indices start:
+; the entrance and the combs at slot 0, the allpasses at slot 1, which is
+; the slot their first frame reads and writes.
+reverb_prepare:
+        clr     a
+        move    #>-1,m0
+        move    #>RV_ENT_BASE,r0
+        do      #RV_ENT_SIZE,reverb_ent_cleared
+        move    a1,y:(r0)+
+reverb_ent_cleared:
+        move    #>RV_AP0_BASE,r0
+        do      #RV_AP0_SIZE,reverb_ap0_cleared
+        move    a1,y:(r0)+
+reverb_ap0_cleared:
+        move    #>RV_AP1_BASE,r0
+        do      #RV_AP1_SIZE,reverb_ap1_cleared
+        move    a1,y:(r0)+
+reverb_ap1_cleared:
+        move    #>RV_AP2_BASE,r0
+        do      #RV_AP2_SIZE,reverb_ap2_cleared
+        move    a1,y:(r0)+
+reverb_ap2_cleared:
+        move    #>RV_COMB1_BASE,r0
+        do      #RV_COMB1_SIZE,reverb_comb1_cleared
+        move    a1,y:(r0)+
+reverb_comb1_cleared:
+        move    #>RV_COMB2_BASE,r0
+        do      #RV_COMB2_SIZE,reverb_comb2_cleared
+        move    a1,y:(r0)+
+reverb_comb2_cleared:
+        move    #>RV_COMB3_BASE,r0
+        do      #RV_COMB3_SIZE,reverb_comb3_cleared
+        move    a1,y:(r0)+
+reverb_comb3_cleared:
+        move    #>RV_ENT_BASE,r0
+        move    #>RV_ENT_SIZE-1,m0
+        move    #>RV_AP0_BASE+1,r1
+        move    #>RV_AP0_SIZE-1,m1
+        move    #>RV_AP1_BASE+1,r2
+        move    #>RV_AP1_SIZE-1,m2
+        move    #>RV_AP2_BASE+1,r3
+        move    #>RV_AP2_SIZE-1,m3
+        move    #>RV_COMB1_BASE,r4
+        move    #>RV_COMB1_SIZE-1,m4
+        move    #>RV_TAP_R1,n4
+        move    #>RV_COMB2_BASE,r5
+        move    #>RV_COMB2_SIZE-1,m5
+        move    y:<rv_n5l,n5
+        move    #>RV_COMB3_BASE,r7
+        move    #>RV_COMB3_SIZE-1,m7
+        move    #>RV_TAP_L3,n7
+        move    #>LA32_OUTPUT_BASE,r6
+        move    #>-1,m6
+        rts
+
+; Nothing to install: the reverb image carries no boot-time tables.
+la32_tables_install:
+        rts
+
+        ELSE
+
+; Partial image: install, clear the output buffer, render with the kernel
+; and wave the configuration names, fold and reply.
+command_profile:
+        move    y:last_command,a
+        move    #>$0000ff,x0
+        and     x0,a
+        jsr     profile_install
         ; the loop advances before it renders, so start one step early and
         ; the first frame is Munt's position zero
         clr     a
@@ -709,6 +1013,9 @@ command_profile_saw:
         jsr     la32_saw_run
         jmp     command_profile_fold
 command_profile_perceptual:
+        move    #>1,x0
+        cmp     x0,a
+        jne     command_unknown         ; a reverb run needs the other image
         move    y:<la_saw,a
         tst     a
         jne     command_profile_psaw
@@ -717,14 +1024,7 @@ command_profile_perceptual:
 command_profile_psaw:
         jsr     la32_psaw_run
 command_profile_fold:
-        move    #>LA32_OUTPUT_BASE,r6
-        move    #>LA32_OUTPUT_WORDS,x0
-        clr     a
-        do      x0,command_profile_folded
-        move    x:(r6)+,x1
-        asl     a
-        add     x1,a
-command_profile_folded:
+        jsr     profile_fold
         jsr     send_reply
         jmp     command_loop
 
@@ -745,6 +1045,8 @@ la32_const_installed:
         move    a1,x:(r4)+
 la32_unlog_installed:
         rts
+
+        ENDIF
 
 ; -----------------------------------------------------------------------------
 ; Source 1: DSP-generated tone
@@ -1022,9 +1324,13 @@ render_tone_period_done:
 ; The generated tables are P-memory data, not code: the stage-two loader
 ; carries P sections only, and generate_dsp_stage2.py fails the build if the
 ; kernel above ever grows into them. The tone table image sits at the P alias
-; of Y:$0800; la32tabs.inc carries its own org lines the same way.
+; of Y:$0800; the LA32 includes carry their own org lines the same way.
         org     p:$800
         include 'tonetabs.inc'          ; DOS assembler requires an 8.3 name
+        IF      @DEF(LA32_REVERB_IMAGE)
+        include 'la32rvb.inc'
+        ELSE
         include 'la32tabs.inc'
+        ENDIF
 
         end

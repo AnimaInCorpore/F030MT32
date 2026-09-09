@@ -27,17 +27,22 @@ RELEASE_DIR := release
 ROMS_DIR ?= roms
 
 DSP_STAGE2_IMAGE := $(GENERATED_BUILD)/dsp_stage2_image.i
+DSP_REVERB_IMAGE := $(GENERATED_BUILD)/dsp_reverb_image.i
 TONE_TABLE := $(GENERATED_BUILD)/tone_table.inc
 
-# LA32 profile spike: the native Munt oracle, the tables it dumps, and the
-# DSP-side table image derived from them (see tools/la32_partial.py).
+# LA32 profile spikes: the native Munt oracle, the tables it dumps, the
+# DSP-side table image derived from them, and the reverb image's data - its
+# run constants and the input frames, which are the oracle's own output for
+# the partial run the reverb processes (see tools/la32_partial.py).
 NATIVE_BUILD := build/native
 MUNT_SRC := third_party/munt/mt32emu/src
 LA32_ORACLE := $(NATIVE_BUILD)/la32_partial_oracle.exe
 LA32_TABLE_DUMP := $(GENERATED_BUILD)/la32_tables.txt
 LA32_TABLES := $(GENERATED_BUILD)/la32tabs.inc
+LA32_REVERB_TABLES := $(GENERATED_BUILD)/la32rvb.inc
 LA32_PROFILE_DIR := build/la32-profile
 LA32_REFERENCE_DIR := build/reference
+LA32_REVERB_INPUT := $(LA32_REFERENCE_DIR)/la32-partial-1.txt
 CXX ?= g++
 
 M68K_SOURCES := \
@@ -103,9 +108,9 @@ help:
 	@echo "  verbose    build the traced bring-up executable (mt32verb.tos)"
 	@echo "  oracle     build the native Munt LA32 partial oracle"
 	@echo "  profile-partial CFG=n"
-	@echo "             profile one LA32 synth partial under Hatari and check"
-	@echo "             its output against the oracle: runs 0-3 are the exact"
-	@echo "             kernel, 4-7 the perceptual one, same configurations"
+	@echo "             profile one DSP spike under Hatari and check its output"
+	@echo "             against the oracle: runs 0-3 are the exact LA32 partial,"
+	@echo "             4-7 the perceptual one, 8-9 the Boss reverb over run 1"
 	@echo "  profile-partials"
 	@echo "             the same for every run"
 	@echo "  clean      remove generated build/ and release/ directories"
@@ -119,9 +124,10 @@ help:
 
 host: $(RELEASE_DIR)/f030mt32.tos $(RELEASE_DIR)/f030mt32.ttp
 
-dsp: $(RELEASE_DIR)/la32.lod $(DSP_STAGE2_IMAGE)
+dsp: $(RELEASE_DIR)/la32.lod $(RELEASE_DIR)/reverb.lod $(DSP_STAGE2_IMAGE) \
+	$(DSP_REVERB_IMAGE)
 
-reference: $(TONE_TABLE) $(LA32_TABLES)
+reference: $(TONE_TABLE) $(LA32_TABLES) $(LA32_REVERB_TABLES)
 
 oracle: $(LA32_ORACLE)
 
@@ -162,12 +168,13 @@ $(TONE_TABLE): tools/generate_tone_table.py src/dsp/protocol.inc
 # whole library. LGPL code, build-time only, nothing of it reaches the Falcon.
 $(LA32_ORACLE): tools/la32_partial_oracle.cpp tools/mt32emu_config/config.h \
 		$(MUNT_SRC)/LA32WaveGenerator.cpp $(MUNT_SRC)/LA32WaveGenerator.h \
-		$(MUNT_SRC)/Tables.cpp $(MUNT_SRC)/Tables.h
+		$(MUNT_SRC)/Tables.cpp $(MUNT_SRC)/Tables.h \
+		$(MUNT_SRC)/BReverbModel.cpp $(MUNT_SRC)/BReverbModel.h
 	@mkdir -p $(NATIVE_BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++17 -O2 \
 		-Itools/mt32emu_config -I$(MUNT_SRC) \
 		tools/la32_partial_oracle.cpp $(MUNT_SRC)/LA32WaveGenerator.cpp \
-		$(MUNT_SRC)/Tables.cpp -o $@
+		$(MUNT_SRC)/Tables.cpp $(MUNT_SRC)/BReverbModel.cpp -o $@
 
 $(LA32_TABLE_DUMP): $(LA32_ORACLE)
 	@mkdir -p $(GENERATED_BUILD)
@@ -176,20 +183,31 @@ $(LA32_TABLE_DUMP): $(LA32_ORACLE)
 $(LA32_TABLES): tools/la32_partial.py $(LA32_TABLE_DUMP)
 	python3 tools/la32_partial.py tables --tables $(LA32_TABLE_DUMP) > $@
 
+# The reverb's input is the exact partial's oracle output for run 1, the
+# same frames the DSP reproduces word for word in its own run.
+$(LA32_REVERB_INPUT): $(LA32_ORACLE) tools/la32_partial.py
+	@mkdir -p $(LA32_REFERENCE_DIR)
+	$(LA32_ORACLE) $$(python3 tools/la32_partial.py oracle-args 1) > $@
+
+$(LA32_REVERB_TABLES): tools/la32_partial.py $(LA32_REVERB_INPUT)
+	python3 tools/la32_partial.py reverb-tables --input $(LA32_REVERB_INPUT) > $@
+
 # -----------------------------------------------------------------------------
 # DSP
 # -----------------------------------------------------------------------------
 
-$(DSP_BUILD)/BUILD.BAT: tools/BUILD_DSP.BAT src/dsp/la32.asm \
+$(DSP_BUILD)/BUILD.BAT: tools/BUILD_DSP.BAT src/dsp/la32.asm src/dsp/reverb.asm \
 		src/dsp/stage2_loader.asm src/dsp/protocol.inc $(TONE_TABLE) \
-		$(LA32_TABLES)
+		$(LA32_TABLES) $(LA32_REVERB_TABLES)
 	@mkdir -p $(DSP_BUILD)
 	cp tools/BUILD_DSP.BAT $(DSP_BUILD)/BUILD.BAT
 	cp src/dsp/la32.asm $(DSP_BUILD)/LA32.ASM
+	cp src/dsp/reverb.asm $(DSP_BUILD)/REVERB.ASM
 	cp src/dsp/protocol.inc $(DSP_BUILD)/
 	cp src/dsp/stage2_loader.asm $(DSP_BUILD)/LA32BOOT.ASM
 	cp $(TONE_TABLE) $(DSP_BUILD)/tonetabs.inc
 	cp $(LA32_TABLES) $(DSP_BUILD)/la32tabs.inc
+	cp $(LA32_REVERB_TABLES) $(DSP_BUILD)/la32rvb.inc
 	cp $(DSP_TOOL_SOURCE)/ASM56000.EXE $(DSP_TOOL_SOURCE)/CLDLOD.EXE \
 		$(DSP_TOOL_SOURCE)/DOS4GW.EXE $(DSP_TOOL_SOURCE)/ioequ.inc $(DSP_BUILD)/
 	@touch $@
@@ -200,16 +218,22 @@ $(DSP_BUILD)/.assembled: $(DSP_BUILD)/BUILD.BAT
 		exit 1; \
 	fi
 	@rm -f $(DSP_BUILD)/LA32.CLD $(DSP_BUILD)/LA32.LOD $(DSP_BUILD)/LA32.LST \
+		$(DSP_BUILD)/REVERB.CLD $(DSP_BUILD)/REVERB.LOD $(DSP_BUILD)/REVERB.LST \
 		$(DSP_BUILD)/LA32BOOT.CLD $(DSP_BUILD)/LA32BOOT.LOD \
 		$(DSP_BUILD)/LA32BOOT.LST
 	"$(DOSBOX)" $(DOSBOX_FLAGS) "$(abspath $(DSP_BUILD)/BUILD.BAT)"
 	@test -s $(DSP_BUILD)/LA32.LOD
+	@test -s $(DSP_BUILD)/REVERB.LOD
 	@test -s $(DSP_BUILD)/LA32BOOT.LOD
 	@touch $@
 
 $(RELEASE_DIR)/la32.lod: $(DSP_BUILD)/.assembled
 	@mkdir -p $(RELEASE_DIR)
 	cp $(DSP_BUILD)/LA32.LOD $@
+
+$(RELEASE_DIR)/reverb.lod: $(DSP_BUILD)/.assembled
+	@mkdir -p $(RELEASE_DIR)
+	cp $(DSP_BUILD)/REVERB.LOD $@
 
 # The LA32 render loops occupy internal P:$0080-$01ff, the rest of the kernel
 # P:$0200-$05ff, the small LA32 images P:$0700, and the tone table and the
@@ -223,12 +247,20 @@ $(DSP_STAGE2_IMAGE): tools/generate_dsp_stage2.py $(DSP_BUILD)/.assembled
 		--bootstrap $(DSP_BUILD)/LA32BOOT.LOD \
 		--program $(DSP_BUILD)/LA32.LOD > $@
 
+# The reverb spike's image shares the bootstrap; its symbols carry a prefix
+# so the host can embed both.
+$(DSP_REVERB_IMAGE): tools/generate_dsp_stage2.py $(DSP_BUILD)/.assembled
+	@mkdir -p $(GENERATED_BUILD)
+	python3 tools/generate_dsp_stage2.py \
+		--bootstrap $(DSP_BUILD)/LA32BOOT.LOD \
+		--program $(DSP_BUILD)/REVERB.LOD --prefix dsp_reverb > $@
+
 # -----------------------------------------------------------------------------
 # 68030
 # -----------------------------------------------------------------------------
 
 $(M68K_BUILD)/%.o: src/m68k/%.s src/m68k/xbios.i src/m68k/verbose.i \
-		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(VASM)
+		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(DSP_REVERB_IMAGE) $(VASM)
 	@mkdir -p $(M68K_BUILD)
 	$(VASM) $< -quiet -Felf -m68030 -Isrc/m68k -I$(GENERATED_BUILD) \
 		-o $@ -L $(M68K_BUILD)/$*.lst
@@ -246,7 +278,7 @@ $(RELEASE_DIR)/f030mt32.ttp: $(RELEASE_DIR)/f030mt32.tos
 # console. Each step prints its label before the call and its result after, so
 # a hang leaves a dangling label naming the call that never returned.
 $(VERBOSE_M68K_BUILD)/%.o: src/m68k/%.s src/m68k/xbios.i src/m68k/verbose.i \
-		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(VASM)
+		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(DSP_REVERB_IMAGE) $(VASM)
 	@mkdir -p $(VERBOSE_M68K_BUILD)
 	$(VASM) $< -quiet -Felf -m68030 -DVERBOSE_BOOT \
 		-Isrc/m68k -I$(GENERATED_BUILD) -o $@ \
@@ -272,11 +304,15 @@ check: all reference
 	@rg -q "^0 +Warnings" $(DSP_BUILD)/LA32.LST
 	@rg -q "^0 +Errors" $(DSP_BUILD)/LA32BOOT.LST
 	@rg -q "^0 +Warnings" $(DSP_BUILD)/LA32BOOT.LST
+	@rg -q "^0 +Errors" $(DSP_BUILD)/REVERB.LST
+	@rg -q "^0 +Warnings" $(DSP_BUILD)/REVERB.LST
 	@rg -q "^DSP_BOOT_WORDS equ " $(DSP_STAGE2_IMAGE)
 	@rg -q "^DSP_STAGE2_PROGRAM_WORDS equ " $(DSP_STAGE2_IMAGE)
+	@rg -q "^DSP_REVERB_STAGE2_PROGRAM_WORDS equ " $(DSP_REVERB_IMAGE)
 	@rg -q "^tone_table_image:" $(TONE_TABLE)
 	@rg -q "^la32_cfg_image:" $(LA32_TABLES)
 	@rg -q "^la32_unlog_image:" $(LA32_TABLES)
+	@rg -q "^la32_reverb_input_image:" $(LA32_REVERB_TABLES)
 	# The two protocol headers are one contract in two syntaxes; only their
 	# first line, which names the other file, may differ. Spelled without
 	# process substitution so the recipe works under a plain /bin/sh.
@@ -337,13 +373,14 @@ LA32_PROFILE_REFERENCE = $(LA32_REFERENCE_DIR)/la32-partial-$(CFG).txt
 
 profile-partial: check tools/profile_dsp.py tools/la32_partial.py
 	$(call require_hatari,profile-partial)
-	@test -n "$(CFG)" || { echo "error: profile-partial needs CFG=0..7" >&2; exit 1; }
+	@test -n "$(CFG)" || { echo "error: profile-partial needs CFG=0..9" >&2; exit 1; }
 	@rm -rf $(LA32_PROFILE_RUN)
 	@mkdir -p $(LA32_PROFILE_RUN) $(LA32_REFERENCE_DIR)
 	@$(LA32_ORACLE) $$(python3 tools/la32_partial.py oracle-args $(CFG)) \
+		< $$(python3 tools/la32_partial.py oracle-stdin $(CFG)) \
 		> $(LA32_PROFILE_REFERENCE)
 	@python3 tools/profile_dsp.py prepare \
-		--listing $(DSP_BUILD)/LA32.LST \
+		--listing $(DSP_BUILD)/$$(python3 tools/la32_partial.py listing $(CFG)) \
 		--output-dir $(LA32_PROFILE_RUN) \
 		--marker $$((0x01c000 + $(CFG))) \
 		--start-symbol la32_$$(python3 tools/la32_partial.py loop $(CFG))_loop \
@@ -373,19 +410,19 @@ profile-partial: check tools/profile_dsp.py tools/la32_partial.py
 	@python3 tools/la32_partial.py compare \
 		--dump $(LA32_PROFILE_RUN)/debug.log \
 		--oracle $(LA32_PROFILE_REFERENCE) $(CFG)
-	# The exact kernel's reply must also carry the oracle's checksum through
+	# The exact kernels' reply must also carry the oracle's checksum through
 	# the host port; the perceptual kernel's buffer differs by design.
-	@if [ "$$(python3 tools/la32_partial.py kernel $(CFG))" = exact ]; then \
+	@if [ "$$(python3 tools/la32_partial.py kernel $(CFG))" != perceptual ]; then \
 		rg -q "Transfer 0x$$(python3 tools/la32_partial.py expected-checksum \
 			--oracle $(LA32_PROFILE_REFERENCE))" $(LA32_PROFILE_RUN)/trace.txt; \
 	fi
 	@python3 tools/profile_dsp.py report \
-		--listing $(DSP_BUILD)/LA32.LST \
+		--listing $(DSP_BUILD)/$$(python3 tools/la32_partial.py listing $(CFG)) \
 		--profile $(LA32_PROFILE_RUN)/profile.txt \
 		--output $(LA32_PROFILE_RUN)/report.txt \
 		--samples 2048 --sample-rate 32779.947916 \
 		--unit-label "codec frame" \
-		--title "DSP56001 LA32 synth partial, configuration $(CFG) ($$(python3 tools/la32_partial.py name $(CFG)))"
+		--title "DSP56001 profile run $(CFG) ($$(python3 tools/la32_partial.py name $(CFG)))"
 
 profile-partials:
 	@for cfg in $$(seq 0 $$(( $$(python3 tools/la32_partial.py count) - 1 ))); do \

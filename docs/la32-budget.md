@@ -8,9 +8,9 @@ listed at the bottom have started, and their numbers are the headline:
 > **One LA32 synth partial costs 77 DSP56001 instruction cycles per codec
 > frame as a square wave and 100 as a sawtooth when it reproduces Munt's
 > integer model bit for bit, and 53 and 64 when it leaves the log domain
-> through single-table lookups within one or two output words of that model**,
-> measured under the DSP-calibrated Hatari on 2026-09-09
-> (`make profile-partials`).
+> through single-table lookups within one or two output words of that model.
+> The Boss reverb costs 92 cycles per frame, bit for bit.** All measured
+> under the DSP-calibrated Hatari on 2026-09-09 (`make profile-partials`).
 
 Everything below the measurement section is arithmetic that follows from it.
 F030MXDRV remains the cautionary precedent: its first feasibility guess was an
@@ -39,19 +39,21 @@ cycle profiles like the ones below are the same on either build.
 
 ### What was measured
 
-`src/dsp/la32.asm` carries `MT32_CMD_PROFILE_PARTIAL`: two DSP56001 kernels
-for one synth partial with amp, pitch and cutoff held constant, which is
-exactly how a block-rate production kernel would present them between control
-updates. Each renders 2,048 frames into X:$1000, pan-mixed into an interleaved
-stereo accumulation buffer the way `Partial::produceAndMixSample` does, and
-Hatari's DSP profiler brackets the render loop between its first and last
-instruction.
+`src/dsp/la32.asm` carries `MT32_CMD_PROFILE_PARTIAL`, which renders one of
+ten runs into X:$1000 while Hatari's DSP profiler brackets the render loop
+between its first and last instruction: two kernels for one synth partial
+with amp, pitch and cutoff held constant, which is exactly how a block-rate
+production kernel would present them between control updates, and the Boss
+reverb over one partial's output. Each partial kernel pan-mixes into an
+interleaved stereo accumulation buffer the way `Partial::produceAndMixSample`
+does; the reverb processes the buffer in place.
 
 The output is checked, not auditioned. `tools/la32_partial_oracle.cpp` drives
-Munt's own `LA32IntPartialPair` with the same parameters, and
-`tools/la32_partial.py compare` grades the DSP buffer the emulator's debugger
-dumps at the end breakpoint against the oracle's frames. Four configurations
-are rendered by both kernels, eight runs in all:
+Munt's own `LA32IntPartialPair` and `BReverbModel` with the same parameters,
+and `tools/la32_partial.py compare` grades the DSP buffer the emulator's
+debugger dumps at the end breakpoint against the oracle's frames. Four
+configurations are rendered by both partial kernels, then the reverb runs at
+two settings over the second configuration:
 
 | # | Wave | Pulse width | Resonance | Cutoff | Note | TVA target |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -59,6 +61,10 @@ are rendered by both kernels, eight runs in all:
 | 1 | square | 200 | 20 | 220 (long linear segments) | G4 | 200 |
 | 2 | sawtooth | 128 | 31 | 240 (the clamp) | C6 | 230 |
 | 3 | sawtooth | 90 | 8 | 136 (sinusoidal resonance decay band) | C3 | 235 |
+
+Runs 0-3 are the exact kernel, 4-7 the perceptual one, 8 and 9 the reverb at
+the MT-32's power-on setting (room, time 5, level 3) and at its longest and
+loudest (time 7, level 7).
 
 ### The exact kernel
 
@@ -166,6 +172,57 @@ words against 9,280, most of it the doubled signed sine table and the
 192-word guard the gain table carries for negative arguments; a single sine
 copy costs one `eor` per frame and would give 2,048 words back.
 
+### The reverb
+
+A port of `BReverbModel` in the MT-32's room mode and Munt's default
+non-precise integer form: a 576-word entrance delay with a low-pass filter,
+three allpasses of 994, 729 and 78 words, three combs of 2,040, 2,752 and
+3,629 words with six output taps, the 1.5-weighted comb mix, its clip to
+sixteen bits and the wet level. Every delay line is a modulo pointer, so a
+line costs one read and one write per frame and no address arithmetic; the
+taps step a comb's pointer forward by the tap distance and back with
+post-update moves that ride on the mix's transfers, so they cost nothing
+beyond the read. `weirdMul` is a fractional multiply by the factor shifted
+into a Q23 fraction, halving one by 2^22, both exact floors, and the clip is
+two compares with `Tcc`.
+
+Both runs equal Munt's output word for word:
+
+| Run | Cycles/frame | Instructions/frame |
+| --- | ---: | ---: |
+| 8 room, time 5, level 3 | 92.00 | 92 |
+| 9 room, time 7, level 7 | 92.00 | 92 |
+
+The cost does not depend on time or level, which only change factors, and
+the hall and plate modes have the same instruction count with longer lines.
+The first version measured 106; folding the constant loads into free
+parallel slots, passing the link between allpasses in an accumulator, and
+forming the 1.5-weighted taps with `mac` took it to 92. Per frame:
+
+| Stage | Cycles | What it is |
+| --- | ---: | --- |
+| Dry input | 9 | two quarter-scale multiplies, the sum, the dry amp |
+| Entrance delay | 5 | low-pass, amp, store, link out |
+| Allpasses | 22 | seven or eight each: halve, subtract, store, halve, add |
+| Combs | 24 | eight each: two reads, two factor multiplies, subtract, store |
+| Left output | 15 | three taps, two 1.5 sums, clip, wet, store |
+| Right output | 17 | the same, with comb 2's second tap offset swapped in and out |
+
+Ninety-two is more than the "about 60" this page estimated before measuring:
+the estimate counted taps and multiplies and forgot that every one of them
+sits in an integer model whose floors, sixteen-bit clip and dry and wet
+scalings each cost an instruction of their own.
+
+The room mode's 10,798 words of delay line take 13,440 words of address
+space, because a modulo pointer wraps only inside a block aligned to the
+power of two above its line's length; the spike places them in Y between the
+code alias and the top of the SRAM. The hall mode's 4,519-word comb needs an
+8,192-aligned block, and its seven lines do not fit in Y alone: they would
+have to spread across X and Y, or the longest lines would have to give up
+modulo addressing for a compare-and-wrap of about three cycles per line.
+The tap-delay mode is one 16,003-word line and cheaper to run, but needs a
+16,384-aligned block, which only X:$0000 offers.
+
 ## The arithmetic that follows
 
 489.40 cycles per frame, divided by the per-partial cost, with nothing else
@@ -174,24 +231,25 @@ running; and nothing else running is not an option:
 | Fixed cost per frame | Cycles | Basis |
 | --- | ---: | --- |
 | SSI interrupt and transport | about 15 | F030MXDRV, measured on production material |
-| Boss reverb, one mode | about 60 | three allpasses and four combs, one read, MAC and write per tap |
+| Boss reverb, room mode | 92 | measured, this page |
 | Per-block control, amortized | about 20 | envelope, ramp and pitch updates every 32 frames |
-| **Left for partials** | **about 395** | |
+| **Left for partials** | **about 362** | |
 
 | Kernel | Square | Sawtooth |
 | --- | ---: | ---: |
 | exact, of 489 | 6.3 | 4.9 |
-| exact, of 395 | 5.1 | 3.9 |
+| exact, of 362 | 4.7 | 3.6 |
 | perceptual, of 489 | 9.2 | 7.6 |
-| perceptual, of 395 | 7.4 | 6.2 |
+| perceptual, of 362 | 6.8 | 5.7 |
 
-That is **six or seven perceptual partials, five or four exact ones**, and
+That is **five or six perceptual partials, three or four exact ones**, and
 the MT-32's factory timbres lean on sawtooth partials for most sustained
-sounds. A Falcon MT-32 built from this kernel is a six-partial machine before
-the 68030's PCM partials are counted — a few timbres at a time, not a
+sounds. A Falcon MT-32 built from these kernels is a five-partial machine
+before the 68030's PCM partials are counted — a few timbres at a time, not a
 nine-part module. The threshold this page named before any measurement,
 "more than about 60 cycles per partial makes it a four-partial machine", is
-met by the exact kernel and only just escaped by the perceptual one.
+met by the exact kernel and only just escaped by the perceptual one, and the
+reverb turned out half again as expensive as assumed.
 
 ## The levers, in the order they should be tried
 
@@ -207,22 +265,22 @@ the starting condition, and the partial itself is close to its floor.
    [`architecture.md`](architecture.md#the-pcm-rom-problem) — and the
    measurement makes the 68030 the more important half: the number of PCM
    partials it can carry now decides more of the machine than the DSP does.
-3. **A lower internal rate.** Prescale 3 gives 24,584.96 Hz and 652.5
+3. **A cheaper reverb.** The reverb is now the largest single item after the
+   partials themselves. Its clip, its dry and wet scalings and its exact
+   floors are the price of matching Munt word for word; a perceptual reverb
+   with the same delay lines could drop the clip and merge the scalings for
+   perhaps ten to fifteen cycles, and running it at half rate is worth an
+   experiment against the oracle before it is ruled out.
+4. **A lower internal rate.** Prescale 3 gives 24,584.96 Hz and 652.5
    cycles per frame, one third more partials for the top octave. Last
    resort, and it interacts badly with comparing against an oracle.
 
 ## What is affordable
 
-**The reverb.** Munt's `BReverbModel` is three allpasses and four combs; the
-mode-0 CM-32L delay lengths sum to 11,326 samples, the hall mode to 13,954.
-Comb and allpass delay lines are what the DSP56001's modulo addressing exists
-for, and each tap is a read, a MAC and a write. About 60 cycles per frame
-and a comfortable fraction of the 32K SRAM, though modulo buffers must sit at
-power-of-two boundaries, which costs placement care. It is not the problem.
-
-**The tables.** Either kernel's tables are affordable next to the reverb;
-the two together with the period buffers and the program take most of the
-SRAM, and the spike's image, which carries both kernels, is 24K words. All of
+**The tables.** Either partial kernel's tables are affordable next to the
+reverb; the two together with the period buffers and the program take most
+of the SRAM, and the partial spike's image, which carries both kernels, is
+24K words. The reverb spike's image is 5K words plus its delay lines. All of
 it is delivered by the stage-two loader at the P alias of its X and Y homes,
 so nothing copies at run time except the exact kernel's first exponent page,
 which lives in internal X.
@@ -232,7 +290,7 @@ absolute one: 262,144 samples against 32,768 words of SRAM.
 
 ## The experiments that would settle this
 
-Each of these is small. They are listed in dependency order; the first two
+Each of these is small. They are listed in dependency order; the first three
 are done.
 
 1. ~~**Cost one synth partial.**~~ Done: 77 and 100 cycles per frame,
@@ -240,8 +298,8 @@ are done.
 2. ~~**Cost the perceptual partial.**~~ Done: 53 and 64 cycles per frame,
    within one to five words of Munt. `make profile-partial CFG=4..7`
    reproduces it, with the graded gate described above.
-3. **Cost the reverb.** Same method, one mode, real delay lengths. Confirms
-   or refutes the paragraph above.
+3. ~~**Cost the reverb.**~~ Done: 92 cycles per frame, bit-exact, in the
+   room mode. `make profile-partial CFG=8..9` reproduces it.
 4. **Cost the transport.** The scaffold already runs; bracketing
    `receive_period` and the handoff gives the fixed overhead that comes off
    the top of the budget before any synthesis.
@@ -265,8 +323,8 @@ disappointment:
   PCM.
 
 The first condition is met by the exact model and skirted by the perceptual
-one: 53 to 64 cycles buys six or seven partials, not eight. The project is
-therefore only worth continuing as a deliberately reduced machine — the
-perceptual partial, a handful of DSP partials, and as many 68030 PCM
-partials as the host budget allows — and the second condition, still
-unmeasured, decides whether even that is worth having.
+one: 53 to 64 cycles and a 92-cycle reverb buy five or six partials, not
+eight. The project is therefore only worth continuing as a deliberately
+reduced machine — the perceptual partial, a handful of DSP partials, and as
+many 68030 PCM partials as the host budget allows — and the second
+condition, still unmeasured, decides whether even that is worth having.

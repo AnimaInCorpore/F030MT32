@@ -61,6 +61,20 @@ start:
 start_mode_known:                       ; selects the LA32 profile spike
         move.l  d0,run_mode
 
+        ; Two DSP images share one bootstrap loader: the partial spike's,
+        ; and the reverb spike's for the runs from LA32_PROFILE_FIRST_REVERB.
+        lea     dsp_program_image,a0
+        move.l  a0,dsp_image_ptr
+        move.l  #DSP_STAGE2_TRANSFER_WORDS,dsp_image_words
+        cmpi.l  #MODE_PROFILE,d0
+        bne.s   start_image_known
+        cmpi.l  #LA32_PROFILE_FIRST_REVERB,profile_cfg
+        blo.s   start_image_known
+        lea     dsp_reverb_program_image,a0
+        move.l  a0,dsp_image_ptr
+        move.l  #DSP_REVERB_STAGE2_TRANSFER_WORDS,dsp_image_words
+start_image_known:
+
         VB      vb_txt_reserve
         Dsp_Reserve #DSP_X_WORDS,#DSP_Y_WORDS
         VBH
@@ -75,10 +89,18 @@ start_mode_known:                       ; selects the LA32 profile spike
         VB      vb_txt_execboot
         Dsp_ExecBoot dsp_bootstrap_image,#DSP_BOOT_WORDS,#DSP_ABILITY
         VBH
-        VBV     vb_txt_stagewords,#DSP_STAGE2_TRANSFER_WORDS
+        VBV     vb_txt_stagewords,dsp_image_words
         clr.l   dsp_stage2_reply
         VB      vb_txt_stage2
-        Dsp_BlkUnpacked dsp_program_image,#DSP_STAGE2_TRANSFER_WORDS,dsp_stage2_reply,#1
+        ; Dsp_BlkUnpacked with the selected image; the macro takes only
+        ; immediate operands.
+        move.l  #1,-(sp)
+        pea     dsp_stage2_reply
+        move.l  dsp_image_words,-(sp)
+        move.l  dsp_image_ptr,-(sp)
+        move.w  #98,-(sp)
+        trap    #14
+        lea     18(sp),sp
         move.l  dsp_stage2_reply,d0
         VBH
         cmp.l   #DSP_STAGE2_REPLY_OK,d0
@@ -618,6 +640,7 @@ profile_error_text:
 ; never precede start: - included at the top of this file it assembled into
 ; text ahead of the entry point and TOS executed DSP words as 68030 code.
         include "dsp_stage2_image.i"
+        include "dsp_reverb_image.i"
 
         bss
 
@@ -630,6 +653,10 @@ dsp_stage2_reply:
 host_phase:
         ds.l    1
 profile_cfg:
+        ds.l    1
+dsp_image_ptr:
+        ds.l    1
+dsp_image_words:
         ds.l    1
 profile_cfg_byte:
         ds.b    1

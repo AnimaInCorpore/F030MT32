@@ -22,12 +22,14 @@ MT32_CMD_QUERY_PERIODS equ  $090000 ; -> completed period handoffs
 ; reply with the buffer's fold h = (2h + word) mod 2^24. The low byte
 ; selects one of the runs tools/la32_partial.py defines - four
 ; configurations, each rendered by the bit-exact kernel and by the
-; perceptual one; the same byte on a PING is the marker the Hatari cycle
-; profiler arms on. See docs/la32-budget.md.
+; perceptual one, then the Boss reverb over one of them in a second DSP
+; image; the same byte on a PING is the marker the Hatari cycle profiler
+; arms on. See docs/la32-budget.md.
 MT32_CMD_PROFILE_PARTIAL equ $0a0000
 MT32_PROFILE_MARKER equ     $01c000
 LA32_PROFILE_FRAMES equ     2048
-LA32_PROFILE_CONFIGS equ    8
+LA32_PROFILE_CONFIGS equ    10
+LA32_PROFILE_FIRST_REVERB equ 8
 
 ; One transport period. 512 stereo frames at the 32,779.947916 Hz codec rate
 ; is 15.62 ms, the same cadence F030MXDRV's production path was calibrated

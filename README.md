@@ -30,8 +30,9 @@ feasibility spike that decides how much of one fits:
 - the build system, the Hatari smoke gate, and the documented contracts;
 - one LA32 synth partial on the DSP in two kernels — one bit-exact against
   Munt's integer model with its controls held per block, one perceptual —
-  with the native oracle and the Hatari profiling harness that measure
-  both (`make profile-partials`).
+  and the Boss reverb, bit-exact, in a second DSP image, with the native
+  oracle and the Hatari profiling harness that measure all of them
+  (`make profile-partials`).
 
 Of the three questions that decide whether the project is possible, the first
 is answered and the answer is hard:
@@ -39,12 +40,12 @@ is answered and the answer is hard:
 1. **One LA32 partial costs 77 DSP cycles per codec frame as a square wave
    and 100 as a sawtooth when it reproduces Munt bit for bit, and 53 and 64
    when it leaves the log domain through single-table lookups within a few
-   output words of Munt**, against a budget of 489.40 per frame. After the
-   transport, the reverb and the block-rate control take their share, that
-   is six or seven perceptual partials on the DSP — a few timbres at a time,
-   not a nine-part module — and nothing that keeps the LA32's wave shape
-   can reach the 15 cycles that thirty-two partials would need. See
-   [`docs/la32-budget.md`](docs/la32-budget.md).
+   output words of Munt; the reverb costs 92**, against a budget of 489.40
+   per frame. After the transport, the reverb and the block-rate control
+   take their share, that is five or six perceptual partials on the DSP — a
+   few timbres at a time, not a nine-part module — and nothing that keeps
+   the LA32's wave shape can reach the 15 cycles that thirty-two partials
+   would need. See [`docs/la32-budget.md`](docs/la32-budget.md).
 2. **The PCM ROM does not fit and never will.** It is 262,144 samples against
    32,768 words of Falcon DSP SRAM. The proposed answer — the 68030 renders
    PCM partials and streams the result, exactly as F030MXDRV streams decoded
@@ -117,7 +118,7 @@ make check
 | `make check` | build everything and validate the generated artefacts | DOSBox |
 | `make smoke` | score boot and transport under Hatari | Hatari |
 | `make oracle` | build the native Munt LA32 partial oracle | C++17 |
-| `make profile-partial CFG=n` | render run `n` of one LA32 partial on the DSP and report its cycle cost: runs 0-3 are the exact kernel, checked word for word against the oracle, runs 4-7 the perceptual kernel on the same configurations, checked against error bounds | Hatari |
+| `make profile-partial CFG=n` | render run `n` on the DSP and report its cycle cost: runs 0-3 are the exact LA32 partial, checked word for word against the oracle, runs 4-7 the perceptual kernel on the same configurations, checked against error bounds, runs 8-9 the Boss reverb over run 1, word for word | Hatari |
 | `make profile-partials` | the same for every run | Hatari |
 | `make verbose` | build the traced bring-up executable | DOSBox |
 | `make run` | launch the self-test executable in Hatari | Hatari |
@@ -125,10 +126,11 @@ make check
 The outputs are:
 
 ```text
-release/f030mt32.tos  self-test and bring-up program
+release/f030mt32.tos  self-test, bring-up and profile program
 release/f030mt32.ttp  the same program with a Desktop command-line entry
 release/mt32verb.tos  the traced build, from `make verbose`
-release/la32.lod      readable DSP assembler artifact
+release/la32.lod      readable DSP assembler artifact, the partial image
+release/reverb.lod    the same source assembled as the reverb image
 ```
 
 `make clean` removes only generated `build/` and `release/` content. `roms/`
@@ -183,11 +185,13 @@ The intended contracts, in the order they have to be established:
    under Hatari by `make smoke`.
 2. **Feasibility.** Measured DSP cycles for one LA32 partial, the reverb, and
    the transport against the 489.40-cycle frame budget, before any synthesis
-   is committed to. The partial is measured: `make profile-partials` renders
-   four configurations with each kernel, requires the exact kernel to equal
-   Munt's output word for word and the perceptual one to stay within its
-   error bounds, and reports 77 and 100 cycles per frame for the former, 53
-   and 64 for the latter. The reverb and the transport are not yet.
+   is committed to. The partial and the reverb are measured:
+   `make profile-partials` renders four configurations with each partial
+   kernel and the reverb at two settings, requires the exact kernels to
+   equal Munt's output word for word and the perceptual one to stay within
+   its error bounds, and reports 77 and 100 cycles per frame for the exact
+   partial, 53 and 64 for the perceptual one, 92 for the reverb. The
+   transport is not measured yet.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the
    production renderer — the same two-tier split F030MXDRV uses against
@@ -197,7 +201,9 @@ The intended contracts, in the order they have to be established:
 ## Repository map
 
 - `src/dsp/la32.asm`: scaffold DSP kernel — protocol, codec transport, test
-  tone, and the exact and perceptual LA32 partials behind the profile spike.
+  tone, the exact and perceptual LA32 partials behind the profile spike, and
+  the Boss reverb; `src/dsp/reverb.asm` assembles the same source as the
+  reverb image.
 - `src/dsp/stage2_loader.asm`: sparse embedded P-memory loader.
 - `src/dsp/protocol.inc`, `src/m68k/protocol.i`: the one host/DSP contract in two syntaxes.
 - `src/m68k/main.s`: Falcon bootstrap, sound matrix, self-test, bring-up and profile modes.
