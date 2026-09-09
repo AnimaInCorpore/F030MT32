@@ -1,7 +1,6 @@
         include "xbios.i"
         include "verbose.i"
         include "protocol.i"
-        include "dsp_stage2_image.i"
 
         global  start
         ifd     VERBOSE_BOOT
@@ -534,6 +533,12 @@ sound_error_text:
 audio_error_text:
         dc.b    'audio transport failed',13,10,0
         even
+
+; The generated DSP image closes the data section, as in F030MXDRV. A TOS
+; executable starts at the first byte of its text segment, so the image must
+; never precede start: - included at the top of this file it assembled into
+; text ahead of the entry point and TOS executed DSP words as 68030 code.
+        include "dsp_stage2_image.i"
 
         bss
 
