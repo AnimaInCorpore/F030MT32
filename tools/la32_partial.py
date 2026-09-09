@@ -4,23 +4,28 @@
 One source of truth for the feasibility measurement in docs/la32-budget.md:
 
 - ``tables``        emits the DSP56001 P-memory image of every lookup table
-                    the kernel needs plus the per-configuration block
-                    constants, derived from the exp9/logsin9 tables the Munt
-                    oracle dumps;
-- ``oracle-args N`` prints the oracle command line for configuration N;
+                    the two kernels need plus the per-run block constants,
+                    derived from the exp9/logsin9 tables the Munt oracle dumps;
+- ``oracle-args N`` prints the oracle command line for run N;
 - ``constants N``   prints the derived block constants for inspection;
 - ``compare``       checks a Hatari ``dm x`` dump of the DSP output buffer
-                    against the oracle's frames, word for word, and prints
-                    the buffer checksum the DSP replies with.
+                    against the oracle's frames: word for word for the exact
+                    kernel, against error bounds for the perceptual one.
 
-The arithmetic mirrors Munt's LA32WaveGenerator.cpp with amp, pitch and
-cutoff held constant. Every derived value is documented next to the C++
-it comes from, so a disagreement is a diff rather than an opinion.
+A run is a configuration (wave, pulse width, resonance, amp, pitch, cutoff)
+rendered by one of two kernels: ``exact`` reproduces Munt's integer
+LA32WaveGenerator bit for bit; ``perceptual`` keeps its positions and log
+sums but leaves the log domain through single-table lookups. The arithmetic
+mirrors Munt's LA32WaveGenerator.cpp with amp, pitch and cutoff held
+constant, and every derived value is documented next to the C++ it comes
+from, so a disagreement is a diff rather than an opinion.
 """
 
 from __future__ import annotations
 
 import argparse
+import cmath
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -39,28 +44,33 @@ OUTPUT_WORDS = 2 * PROFILE_FRAMES
 # DSP memory homes of the tables and their P-memory image addresses. Falcon
 # external P aliases the 32K SRAM directly, external Y the same lower 16K
 # word for word, and external X the upper 16K at phys = addr + $4000; so a
-# P section at $3000 lands in Y:$3000 and one at $6000 lands in X:$2000,
+# P section at $2000 lands in Y:$2000 and one at $6000 lands in X:$2000,
 # and the stage-two loader delivers X/Y tables it was never taught about.
-SQUARE_VALUE_X = 0x3000        # X:$3000-$35FF  <- P:$7000
-SQUARE_WINDOW_Y = 0x3000       # Y:$3000-$35FF  <- P:$3000
-SHIFT_Y = 0x3600               # Y:$3600-$3A3F  <- P:$3600
-RESONANCE_Y = 0x3C00           # Y:$3C00-$3FFF  <- P:$3C00
-UNLOG_X = 0x0000               # X:$0000-$0FFF  <- P:$4000 (first page copied at boot)
 X_ALIAS = 0x4000
+UNLOG_X = 0x0000          # exact: interpolateExp(frac)<<8, 4096; first page copied at boot
+SQUARE_EXACT = 0x2000     # exact: X sine<<2 (log), Y window; FWD, ZERO, REV
+SQUARE_PERC = 0x2600      # perceptual: X linear sine*4, Y window copy
+COSINE_X = 0x2C00         # perceptual: +/-cosine*1024, 2048, sign in bit 10
+SHIFT_X = 0x3400          # exact: guard, 2^(15-n), zeros
+GAIN_Y = 0x0900           # perceptual: 2^(-(16j+8)/4096)*2^21 for j = -guard..4095
+GAIN_GUARD = 192
+RESONANCE_Y = 0x1A00      # exact: sine<<2 (log), reversed upper half, 1024
+SINE_Y = 0x2C00           # perceptual: +/-linear sine*4, 2048, twice
 CONST_IMAGE_P = 0x0700
 CONFIG_IMAGE_P = 0x0740
-CONFIG_WORDS = 16
+CONFIG_WORDS = 18
 
-# The shift table maps an unlog integer part n to 2^(15-n): a zero guard for
-# n = -1, sixteen powers, then zeros up to the largest n any configuration
-# can produce, so an out-of-range log unlogs to zero without a clamp - which
-# is what Munt's clamp to 65535 amounts to. Its base entry is the one for
-# n = 0, so la_shtab points one past the guard word.
+# The exact kernel's shift table maps an unlog integer part n to 2^(15-n):
+# a zero guard for n = -1, sixteen powers, then zeros up to the largest n any
+# configuration can produce, so an out-of-range log unlogs to zero without a
+# clamp - which is what Munt's clamp to 65535 amounts to. Its base entry is
+# the one for n = 0, so la_shtab points one past the guard word.
 SHIFT_GUARD = 1
 SHIFT_ENTRIES = 1088
 
-# Fixed internal-Y constants, in the order src/dsp/la32.asm lays them out
-# from la_wphmask upwards; the kernel copies this image at boot.
+# Internal Y layout, mirrored by src/dsp/la32.asm: la_wp3 at $10, these
+# fixed words from $11, three scratch words, then the CONFIG_WORDS block.
+LA_REC1 = 0x37
 FIXED_CONSTANTS = [
     ("la_wphmask", 0x7FF800),
     ("la_sh5", 1 << 18),
@@ -72,11 +82,17 @@ FIXED_CONSTANTS = [
     ("la_pos21", 1 << 21),
     ("la_2p22", 1 << 22),
     ("la_mcos", 0x3FF800),
-    ("la_rec1", 0x2F),
+    ("la_rec1", LA_REC1),
     ("la_sh7", 1 << 7),
     ("la_sgnbit", 0x800000),
-    ("la_shtab", SHIFT_Y + SHIFT_GUARD),
+    ("la_shtab", SHIFT_X + SHIFT_GUARD),
     ("la_rtab", RESONANCE_Y),
+    ("la_mffe0", 0xFFE0),
+    ("la_sh4", 1 << 19),
+    ("la_m65535", 65535),
+    ("la_gtab", GAIN_Y + GAIN_GUARD),
+    ("la_ctab", COSINE_X),
+    ("la_mcos11", 0x7FF000),
 ]
 
 # TVP.cpp keyToPitchTable: keys below 60 use -table[60 - key].
@@ -130,16 +146,40 @@ class Config:
         return pan_factor(14 - self.pan)
 
 
+# The amp levels are TVA ramp targets near the loud end of the range: the
+# LA32 attenuates by an octave per 4096 log units, so a cutoff eight points
+# below the middle already costs 6 dB and a target of 155 would leave the
+# first configuration at a few LSB, where nothing but rounding is measurable.
 CONFIGS = [
     # Cutoff below the middle point: no linear segments, the "sine" square.
-    Config("square-lowcut", False, 128, 1, amp_for_level(155), key_pitch(60, False), 100 << 18, 6),
+    Config("square-lowcut", False, 128, 1, amp_for_level(240), key_pitch(60, False), 120 << 18, 6),
     # Asymmetric pulse, strong resonance, cutoff well above the middle.
     Config("square-pw-res", False, 200, 20, amp_for_level(200), key_pitch(67, False), 220 << 18, 6),
     # Sawtooth at the cutoff ceiling with maximum resonance, two octaves up.
-    Config("saw-maxres", True, 128, 31, amp_for_level(180), key_pitch(84, True), 240 << 18, 6),
+    Config("saw-maxres", True, 128, 31, amp_for_level(230), key_pitch(84, True), 240 << 18, 6),
     # Sawtooth inside the sinusoidal resonance-decay band, one octave down.
-    Config("saw-sinedecay", True, 90, 8, amp_for_level(120), key_pitch(48, True), 136 << 18, 6),
+    Config("saw-sinedecay", True, 90, 8, amp_for_level(235), key_pitch(48, True), 136 << 18, 6),
 ]
+
+KERNELS = ["exact", "perceptual"]
+
+
+@dataclass(frozen=True)
+class Run:
+    config: Config
+    kernel: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.config.name}/{self.kernel}"
+
+    @property
+    def loop(self) -> str:
+        wave = "saw" if self.config.sawtooth else "square"
+        return wave if self.kernel == "exact" else "p" + wave
+
+
+RUNS = [Run(config, kernel) for kernel in KERNELS for config in CONFIGS]
 
 
 class Tables:
@@ -162,6 +202,11 @@ class Tables:
         entry2 = 8191 - self.exp9[index]
         entry1 = 8191 if index == 0 else 8191 - self.exp9[index - 1]
         return entry2 + (((entry1 - entry2) * extra) >> 3)
+
+    def unlog(self, value: int) -> int:
+        """LA32Utilites::unlog magnitude for a clamped 16-bit log value."""
+        value = min(max(value, 0), 65535)
+        return self.interpolate_exp(value & 4095) >> (value >> 12)
 
 
 @dataclass
@@ -214,14 +259,14 @@ def derive(tables: Tables, config: Config) -> Derived:
 
 
 CONFIG_FIELDS = [
-    "step3", "k7", "b3", "ampt", "rbase", "panl9", "panr9", "saw",
-    "h0.resbase", "h0.linear", "h0.df15", "h0.sgn",
-    "h1.resbase", "h1.linear", "h1.df15", "h1.sgn",
+    "step3", "k7", "b3", "ampt", "rbase", "panl", "panr", "saw", "kernel", "sqbase",
+    "h0.f0", "h0.f1", "h0.df15", "h0.f3",
+    "h1.f0", "h1.f1", "h1.df15", "h1.f3",
 ]
 
 
 def max_log(tables: Tables, config: Config, d: Derived) -> int:
-    """Upper bound of any log value the kernel can form for this configuration.
+    """Upper bound of any log value the exact kernel can form.
 
     The resonance log has no clamp on the DSP; its integer part must stay
     inside the zero-padded shift table. R4 never exceeds the longer half of
@@ -238,36 +283,56 @@ def max_log(tables: Tables, config: Config, d: Derived) -> int:
     return max(log, d.ampt + sine_max + (sine_max if config.sawtooth else 0))
 
 
-def config_words(tables: Tables, config: Config) -> list[int]:
+def square_gain(ampt: int) -> int:
+    """Perceptual square amplitude: 2^(-AMPT/4096) as a Q21 fraction."""
+    return int(round(2.0 ** (-ampt / 4096.0) * (1 << 21)))
+
+
+def config_words(tables: Tables, run: Run) -> list[int]:
+    config = run.config
     d = derive(tables, config)
     if d.rbase < -4096:
-        raise SystemExit(f"error: {config.name}: rbase {d.rbase} needs a deeper shift-table guard")
+        raise SystemExit(f"error: {config.name}: rbase {d.rbase} needs a deeper guard zone")
     if (max_log(tables, config, d) >> 12) + SHIFT_GUARD >= SHIFT_ENTRIES:
         raise SystemExit(f"error: {config.name}: a log integer part exceeds the shift table")
-    words = [
+    if -d.rbase >= GAIN_GUARD * 16:
+        raise SystemExit(f"error: {config.name}: rbase {d.rbase} exceeds the gain table guard")
+    common = [
         d.step << 3,                                              # la_step3
         (d.rwlf >> 4) << 7,                                       # la_k7
         (2 * SINE_SEGMENT_RELATIVE_LENGTH + d.high_linear) >> 4,  # la_b3
         d.ampt,                                                   # la_ampt
         d.rbase & WORD_MASK,                                      # la_rbase
-        config.pan_left << 9,                                     # la_panl9
-        config.pan_right << 9,                                    # la_panr9
-        1 if config.sawtooth else 0,                              # la_saw
-        # half 0: sign base, linear length (S4 units), decay << 15, square sign
-        0x400000,
-        d.high_linear >> 4,
-        d.radf << 15,
-        0x400000,
-        # half 1
-        0xC00000,
-        d.low_linear >> 4,
-        (d.radf + 1) << 15,
-        0xC00000,
     ]
+    if run.kernel == "exact":
+        words = common + [
+            config.pan_left << 9,                                 # la_panl
+            config.pan_right << 9,                                # la_panr
+            1 if config.sawtooth else 0,                          # la_saw
+            0,                                                    # la_kernel
+            SQUARE_EXACT,                                         # la_sqbase
+            # half 0: sign base, linear length (S4 units), decay << 15, square sign
+            0x400000, d.high_linear >> 4, d.radf << 15, 0x400000,
+            # half 1
+            0xC00000, d.low_linear >> 4, (d.radf + 1) << 15, 0xC00000,
+        ]
+    else:
+        gain = square_gain(d.ampt)
+        words = common + [
+            min(config.pan_left, 8191) << 10,                     # la_panl
+            min(config.pan_right, 8191) << 10,                    # la_panr
+            1 if config.sawtooth else 0,                          # la_saw
+            1,                                                    # la_kernel
+            SQUARE_PERC,                                          # la_sqbase
+            # half 0: linear length, sine table base, decay << 15, +/-square gain
+            d.high_linear >> 4, SINE_Y, d.radf << 15, gain,
+            # half 1: the sine table copy 1024 words up flips the sign bit
+            d.low_linear >> 4, SINE_Y + 1024, (d.radf + 1) << 15, (-gain) & WORD_MASK,
+        ]
     assert len(words) == CONFIG_WORDS
     for word in words:
         if not 0 <= word <= WORD_MASK:
-            raise SystemExit(f"error: {config.name}: constant {word:#x} exceeds 24 bits")
+            raise SystemExit(f"error: {run.name}: constant {word:#x} exceeds 24 bits")
     return words
 
 
@@ -279,16 +344,39 @@ def dc_lines(words: list[int], width: int = 8) -> list[str]:
     return lines
 
 
+def section(address: int, label: str, comment: str, words: list[int]) -> list[str]:
+    return ["", f"        org     p:${address:04x}      ; {comment}", f"{label}:", *dc_lines(words)]
+
+
 def emit_tables(tables: Tables) -> str:
     ls = tables.logsin9
+    # exact kernel
     forward = [v << 2 for v in ls]
     zero = [0] * 512
     reverse_value = [ls[511 - i] << 2 for i in range(512)]
     reverse_window = [ls[511 - i] << 3 for i in range(512)]
+    window = forward + zero + reverse_window
     resonance = [ls[i] << 2 for i in range(512)] + [ls[1023 - i] << 2 for i in range(512, 1024)]
     unlog = [tables.interpolate_exp(fract) << 8 for fract in range(4096)]
     shift = [0] * SHIFT_GUARD + [1 << (15 - n) for n in range(16)]
     shift += [0] * (SHIFT_ENTRIES - len(shift))
+    # perceptual kernel: the same sine shapes, unlogged once and for all
+    linear = [tables.unlog(v << 2) for v in ls]                 # 8189 at the peak
+    full_scale = tables.unlog(0)
+    linear_square = ([v * 4 for v in linear] + [full_scale * 4] * 512
+                     + [linear[511 - i] * 4 for i in range(512)])
+    signed_sine = []
+    for i in range(2048):
+        k = i & 1023
+        value = linear[k] if k < 512 else linear[1023 - k]
+        signed_sine.append((-value if i & 1024 else value) * 4)
+    cosine = []
+    for i in range(2048):
+        k = i & 1023
+        value = min(linear[k] if k < 512 else linear[1023 - k], 8191)
+        cosine.append((-value if i & 1024 else value) * 1024)
+    gain = [int(round(2.0 ** (-(16 * j + 8) / 4096.0) * (1 << 21)))
+            for j in range(-GAIN_GUARD, 4096)]
 
     lines = [
         "; Generated by tools/la32_partial.py; do not edit.",
@@ -302,32 +390,30 @@ def emit_tables(tables: Tables) -> str:
         f"        org     p:${CONFIG_IMAGE_P:04x}",
         "la32_cfg_image:",
     ]
-    for config in CONFIGS:
-        lines.append(f"; {config.name}")
-        lines.extend(dc_lines(config_words(tables, config)))
-    lines += [
-        "",
-        f"        org     p:${SQUARE_WINDOW_Y:04x}      ; Y:${SQUARE_WINDOW_Y:04x} window part: FWD, ZERO, REV",
-        "la32_square_window_image:",
-        *dc_lines(forward + zero + reverse_window),
-        "",
-        f"        org     p:${SHIFT_Y:04x}      ; Y:${SHIFT_Y:04x} guard, 2^(15-n), zeros",
-        "la32_shift_image:",
-        *dc_lines(shift),
-        "",
-        f"        org     p:${RESONANCE_Y:04x}      ; Y:${RESONANCE_Y:04x} resonance/cosine, reversed upper half",
-        "la32_resonance_image:",
-        *dc_lines(resonance),
-        "",
-        f"        org     p:${UNLOG_X + X_ALIAS:04x}      ; X:${UNLOG_X:04x} interpolateExp(frac) << 8",
-        "la32_unlog_image:",
-        *dc_lines(unlog),
-        "",
-        f"        org     p:${SQUARE_VALUE_X + X_ALIAS:04x}      ; X:${SQUARE_VALUE_X:04x} value part: FWD, ZERO, REV",
-        "la32_square_value_image:",
-        *dc_lines(forward + zero + reverse_value),
-        "",
-    ]
+    for run in RUNS:
+        lines.append(f"; {run.name}")
+        lines.extend(dc_lines(config_words(tables, run)))
+    lines += section(GAIN_Y, "la32_gain_image",
+                     f"Y:${GAIN_Y:04x} perceptual gain 2^(-(16j+8)/4096) * 2^21, {GAIN_GUARD} guard words first", gain)
+    lines += section(RESONANCE_Y, "la32_resonance_image",
+                     f"Y:${RESONANCE_Y:04x} exact resonance/cosine log sine, reversed upper half", resonance)
+    lines += section(SQUARE_EXACT, "la32_square_window_image",
+                     f"Y:${SQUARE_EXACT:04x} window part: FWD, ZERO, REV", window)
+    lines += section(SQUARE_PERC, "la32_square_window_copy_image",
+                     f"Y:${SQUARE_PERC:04x} the same window beside the linear values", window)
+    lines += section(SINE_Y, "la32_sine_image",
+                     f"Y:${SINE_Y:04x} perceptual signed linear sine * 4, sign in bit 10, twice", signed_sine + signed_sine)
+    lines += section(UNLOG_X + X_ALIAS, "la32_unlog_image",
+                     f"X:${UNLOG_X:04x} exact interpolateExp(frac) << 8", unlog)
+    lines += section(SQUARE_EXACT + X_ALIAS, "la32_square_value_image",
+                     f"X:${SQUARE_EXACT:04x} exact log value part: FWD, ZERO, REV", forward + zero + reverse_value)
+    lines += section(SQUARE_PERC + X_ALIAS, "la32_square_linear_image",
+                     f"X:${SQUARE_PERC:04x} perceptual linear value part * 4: FWD, ZERO, REV", linear_square)
+    lines += section(COSINE_X + X_ALIAS, "la32_cosine_image",
+                     f"X:${COSINE_X:04x} perceptual signed cosine * 1024, sign in bit 10", cosine)
+    lines += section(SHIFT_X + X_ALIAS, "la32_shift_image",
+                     f"X:${SHIFT_X:04x} exact guard, 2^(15-n), zeros", shift)
+    lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -384,7 +470,88 @@ def expected_words(rows: list[tuple[int, int, int]]) -> list[int]:
     return words
 
 
-def compare(dump: Path, oracle: Path, config: Config) -> int:
+def fft(values: list[float]) -> list[complex]:
+    """Iterative radix-2 FFT; the frame count is a power of two."""
+    n = len(values)
+    data = [complex(v) for v in values]
+    j = 0
+    for i in range(1, n):
+        bit = n >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j |= bit
+        if i < j:
+            data[i], data[j] = data[j], data[i]
+    length = 2
+    while length <= n:
+        step = cmath.exp(-2j * math.pi / length)
+        for start in range(0, n, length):
+            w = 1 + 0j
+            for k in range(length // 2):
+                u = data[start + k]
+                v = data[start + k + length // 2] * w
+                data[start + k] = u + v
+                data[start + k + length // 2] = u - v
+                w *= step
+        length *= 2
+    return data
+
+
+# Perceptual acceptance bounds, in the 16-bit output domain of one partial
+# (Munt's two components sum to at most 16382, the full scale below). The
+# absolute bounds always apply; the shape bounds - error relative to the
+# signal, correlation, spectral cosine - only once the signal is loud enough
+# for them to measure the waveform rather than its rounding. The values sit
+# at several times the deviation the kernel showed when they were
+# introduced, so a regression is caught while table rounding is not; see
+# docs/la32-budget.md.
+FULL_SCALE = 16384.0
+PERCEPTUAL_MAX_ABS = 64            # any single word
+PERCEPTUAL_RMS_FULL_SCALE_DB = -72.0  # RMS error relative to full scale: about 4 words
+PERCEPTUAL_SHAPE_MIN_RMS = 0.01 * FULL_SCALE
+PERCEPTUAL_RMS_DB = -40.0          # RMS error relative to the RMS signal
+PERCEPTUAL_CORRELATION = 0.9999
+PERCEPTUAL_SPECTRAL_COSINE = 0.9999
+
+
+def grade(dsp: list[int], ref: list[int]) -> tuple[list[str], bool]:
+    n = len(ref)
+    errors = [d - r for d, r in zip(dsp, ref)]
+    max_abs = max(abs(e) for e in errors)
+    signal_rms = math.sqrt(sum(r * r for r in ref) / n)
+    error_rms = math.sqrt(sum(e * e for e in errors) / n)
+    full_scale_db = 20 * math.log10(error_rms / FULL_SCALE) if error_rms > 0 else -999.0
+    rms_db = 20 * math.log10(error_rms / signal_rms) if error_rms > 0 and signal_rms > 0 else -999.0
+    mean_d = sum(dsp) / n
+    mean_r = sum(ref) / n
+    cov = sum((d - mean_d) * (r - mean_r) for d, r in zip(dsp, ref))
+    var_d = sum((d - mean_d) ** 2 for d in dsp)
+    var_r = sum((r - mean_r) ** 2 for r in ref)
+    correlation = cov / math.sqrt(var_d * var_r) if var_d > 0 and var_r > 0 else 0.0
+    spec_d = [abs(v) for v in fft([float(v) for v in dsp])][: n // 2]
+    spec_r = [abs(v) for v in fft([float(v) for v in ref])][: n // 2]
+    dot = sum(a * b for a, b in zip(spec_d, spec_r))
+    norm = math.sqrt(sum(a * a for a in spec_d) * sum(b * b for b in spec_r))
+    spectral = dot / norm if norm > 0 else 0.0
+    shape = signal_rms >= PERCEPTUAL_SHAPE_MIN_RMS
+    lines = [
+        f"  signal rms         {signal_rms:8.1f} words"
+        + ("" if shape else " (below the shape threshold: absolute bounds only)"),
+        f"  max abs error      {max_abs:6d} words (bound {PERCEPTUAL_MAX_ABS})",
+        f"  rms error          {full_scale_db:6.1f} dB of full scale (bound {PERCEPTUAL_RMS_FULL_SCALE_DB:.0f})",
+        f"  rms error          {rms_db:6.1f} dB of the signal (bound {PERCEPTUAL_RMS_DB:.0f})",
+        f"  correlation        {correlation:.6f} (bound {PERCEPTUAL_CORRELATION})",
+        f"  spectral cosine    {spectral:.6f} (bound {PERCEPTUAL_SPECTRAL_COSINE})",
+    ]
+    ok = max_abs <= PERCEPTUAL_MAX_ABS and full_scale_db <= PERCEPTUAL_RMS_FULL_SCALE_DB
+    if shape:
+        ok = ok and (rms_db <= PERCEPTUAL_RMS_DB and correlation >= PERCEPTUAL_CORRELATION
+                     and spectral >= PERCEPTUAL_SPECTRAL_COSINE)
+    return lines, ok
+
+
+def compare(dump: Path, oracle: Path, run: Run) -> int:
     words = parse_dump(dump)
     rows = read_oracle(oracle)
     if len(rows) != PROFILE_FRAMES:
@@ -397,22 +564,35 @@ def compare(dump: Path, oracle: Path, config: Config) -> int:
         )
     buffer = [words[OUTPUT_BASE + i] for i in range(OUTPUT_WORDS)]
     expected = expected_words(rows)
-    mismatches = [i for i in range(OUTPUT_WORDS) if buffer[i] != expected[i]]
     print(
-        f"{config.name}: {PROFILE_FRAMES} frames, DSP checksum ${checksum(buffer):06x}, "
+        f"{run.name}: {PROFILE_FRAMES} frames, DSP checksum ${checksum(buffer):06x}, "
         f"oracle checksum ${checksum(expected):06x}"
     )
-    if mismatches:
-        i = mismatches[0]
-        frame, channel = divmod(i, 2)
-        print(
-            f"  FAIL: {len(mismatches)} of {OUTPUT_WORDS} words differ; first at frame {frame} "
-            f"{'LR'[channel]}: DSP {from_word(buffer[i])} vs oracle {from_word(expected[i])} "
-            f"(oracle sample {rows[frame][0]})"
-        )
-        return 1
-    print("  PASS: every left and right word equals the Munt integer model")
-    return 0
+    if run.kernel == "exact":
+        mismatches = [i for i in range(OUTPUT_WORDS) if buffer[i] != expected[i]]
+        if mismatches:
+            i = mismatches[0]
+            frame, channel = divmod(i, 2)
+            print(
+                f"  FAIL: {len(mismatches)} of {OUTPUT_WORDS} words differ; first at frame {frame} "
+                f"{'LR'[channel]}: DSP {from_word(buffer[i])} vs oracle {from_word(expected[i])} "
+                f"(oracle sample {rows[frame][0]})"
+            )
+            return 1
+        print("  PASS: every left and right word equals the Munt integer model")
+        return 0
+    dsp_left = [from_word(buffer[i]) for i in range(0, OUTPUT_WORDS, 2)]
+    dsp_right = [from_word(buffer[i]) for i in range(1, OUTPUT_WORDS, 2)]
+    ref_left = [left for _s, left, _r in rows]
+    ref_right = [right for _s, _l, right in rows]
+    ok = True
+    for channel, dsp, ref in (("left", dsp_left, ref_left), ("right", dsp_right, ref_right)):
+        lines, channel_ok = grade(dsp, ref)
+        print(f"  {channel}:")
+        print("\n".join(lines))
+        ok = ok and channel_ok
+    print("  PASS: within the perceptual bounds" if ok else "  FAIL: outside the perceptual bounds")
+    return 0 if ok else 1
 
 
 def main() -> None:
@@ -422,26 +602,28 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("tables")
     p.add_argument("--tables", type=Path, required=True, help="oracle --dump-tables output")
-    p = sub.add_parser("oracle-args")
-    p.add_argument("config", type=int)
-    p = sub.add_parser("loop", help="print square or saw: the DSP loop this configuration runs")
-    p.add_argument("config", type=int)
-    p = sub.add_parser("name")
-    p.add_argument("config", type=int)
+    for name, doc in (
+        ("oracle-args", "print the oracle command line for a run"),
+        ("loop", "print the DSP loop a run uses: square, saw, psquare or psaw"),
+        ("kernel", "print exact or perceptual"),
+        ("name", "print the run's name"),
+    ):
+        p = sub.add_parser(name, help=doc)
+        p.add_argument("run", type=int)
     p = sub.add_parser("constants")
     p.add_argument("--tables", type=Path, required=True)
-    p.add_argument("config", type=int)
+    p.add_argument("run", type=int)
     p = sub.add_parser("expected-checksum")
     p.add_argument("--oracle", type=Path, required=True)
     p = sub.add_parser("compare")
     p.add_argument("--dump", type=Path, required=True, help="Hatari debug log holding the dm x dump")
     p.add_argument("--oracle", type=Path, required=True)
-    p.add_argument("config", type=int)
+    p.add_argument("run", type=int)
     sub.add_parser("count")
     args = parser.parse_args()
 
     if args.command == "count":
-        print(len(CONFIGS))
+        print(len(RUNS))
         return
     if args.command == "tables":
         sys.stdout.write(emit_tables(Tables(args.tables)))
@@ -449,21 +631,23 @@ def main() -> None:
     if args.command == "expected-checksum":
         print(f"{checksum(expected_words(read_oracle(args.oracle))):06x}")
         return
-    config = CONFIGS[args.config]
+    run = RUNS[args.run]
     if args.command == "oracle-args":
-        print(oracle_args(config))
+        print(oracle_args(run.config))
     elif args.command == "loop":
-        print("saw" if config.sawtooth else "square")
+        print(run.loop)
+    elif args.command == "kernel":
+        print(run.kernel)
     elif args.command == "name":
-        print(config.name)
+        print(run.name)
     elif args.command == "constants":
         tables = Tables(args.tables)
-        print(config)
-        print(derive(tables, config))
-        for name, word in zip(CONFIG_FIELDS, config_words(tables, config)):
+        print(run)
+        print(derive(tables, run.config))
+        for name, word in zip(CONFIG_FIELDS, config_words(tables, run)):
             print(f"  {name:12s} ${word:06x} {from_word(word)}")
     elif args.command == "compare":
-        sys.exit(compare(args.dump, args.oracle, config))
+        sys.exit(compare(args.dump, args.oracle, run))
 
 
 if __name__ == "__main__":

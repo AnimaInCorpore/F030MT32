@@ -15,33 +15,32 @@
 ; docs/dsp56001-notes.md for the DSP56001 rules this file already obeys.
 ;
 ; The first LA32 code lives here as well. MT32_CMD_PROFILE_PARTIAL renders
-; one synth partial - bit-exact against Munt's integer LA32WaveGenerator with
-; amp, pitch and cutoff held constant, as a block-rate kernel would hold them
-; - into X:$1000 for the Hatari cycle profiler and the oracle comparison in
-; tools/la32_partial.py. The two render loops sit in internal P so their
-; fetches never contend with the external table reads; the transport moved to
-; external P:$0200 to make room, and its scalar state moved to internal Y
-; because internal X now holds the first page of the unlog table. See
-; docs/la32-budget.md for the measurements.
+; one synth partial with amp, pitch and cutoff held constant, as a block-rate
+; kernel would hold them, into X:$1000 for the Hatari cycle profiler and the
+; oracle comparison in tools/la32_partial.py. Two kernels share the machinery:
+; the exact one reproduces Munt's integer LA32WaveGenerator bit for bit, the
+; perceptual one keeps its positions and log sums but leaves the log domain
+; through single-table lookups. The four render loops sit in internal P so
+; their fetches never contend with the external table reads; the transport
+; moved to external P:$0200 to make room, and its scalar state moved to
+; internal Y because internal X now holds the first page of the exact
+; kernel's unlog table. See docs/la32-budget.md for the measurements.
 
         include 'ioequ.inc'
         include 'protocol.inc'
 
-; LA32 spike memory map. tools/la32_partial.py is the source of these
-; addresses: it emits the tables as P sections at the alias of each X/Y home
+; LA32 spike memory map. tools/la32_partial.py is the source of every table
+; address: it emits the tables as P sections at the alias of each X/Y home
 ; (Falcon external P = phys, external Y = phys, external X = phys - $4000),
-; so the stage-two loader delivers X and Y data it was never taught about.
-; The unlog table's first 256 words live in internal X and are copied at boot.
-LA32_SQUARE_FWD     equ     $3000   ; X value and Y window tables, 512 each
-LA32_SQUARE_ZERO    equ     $3200
-LA32_SQUARE_REV     equ     $3400
-LA32_SHIFT_Y        equ     $3600   ; 1088 words: 0, 2^15..2^0, then zeros
-LA32_RESONANCE_Y    equ     $3c00   ; 1024 words: sine<<2, upper half reversed
-LA32_UNLOG_X        equ     $0000   ; 4096 words: interpolateExp(frac)<<8
+; so the stage-two loader delivers X and Y data it was never taught about,
+; and hands the kernel the bases it needs through the constant and
+; configuration images. Only the unlog table's first 256 words, which live
+; in internal X, are copied at boot.
+LA32_UNLOG_X        equ     $0000
 LA32_UNLOG_IMAGE_P  equ     $4000
 LA32_UNLOG_COPY     equ     256
-LA32_CONST_WORDS    equ     15
-LA32_CONFIG_WORDS   equ     16
+LA32_CONST_WORDS    equ     21
+LA32_CONFIG_WORDS   equ     18
 LA32_OUTPUT_BASE    equ     $1000
 LA32_OUTPUT_WORDS   equ     2*LA32_PROFILE_FRAMES
 
@@ -88,7 +87,7 @@ tone_phase:
 tone_step:
         ds      1                       ; 16-bit phase increment per frame
 
-; LA32 partial state, fixed constants and the active configuration, all
+; LA32 partial state, fixed constants and the active run's configuration, all
 ; within the 6-bit short-absolute range so the loops load them for free
 ; beside ALU work. la32_tables_install copies the fixed words from P at boot;
 ; command_profile copies a configuration block over la_step3 onwards. The
@@ -98,18 +97,24 @@ la_wp3          ds      1               ; wave position << 3, advanced per frame
 la_wphmask      ds      1               ; $7ff800 - first fixed word
 la_sh5          ds      1               ; 2^18: mpy by it is a right shift by 5
 la_m511         ds      1
-la_m7fe0        ds      1               ; R4 bits 5-14: the resonance index
+la_m7fe0        ds      1               ; R4 bits 5-14: the exact resonance index
 la_sh12         ds      1               ; 2^11: mpy by it is a right shift by 12
 la_m4095        ds      1
 la_2p14         ds      1
 la_pos21        ds      1               ; 2^21: sawtooth cosine offset, wp3 units
 la_2p22         ds      1
-la_mcos         ds      1               ; $3ff800: cosine index bits
+la_mcos         ds      1               ; $3ff800: exact cosine index bits
 la_rec1         ds      1               ; address of la_half1
 la_sh7          ds      1               ; 2^7
 la_sgnbit       ds      1               ; $800000
-la_shtab        ds      1               ; LA32_SHIFT_Y + 1: the entry for int 0
-la_rtab         ds      1               ; LA32_RESONANCE_Y - last fixed word
+la_shtab        ds      1               ; exact power table entry for integer part 0
+la_rtab         ds      1               ; exact resonance log sine table
+la_mffe0        ds      1               ; R4 bits 5-15: the perceptual signed index
+la_sh4          ds      1               ; 2^19: mpy by it is a right shift by 4
+la_m65535       ds      1
+la_gtab         ds      1               ; perceptual gain table entry for a zero argument
+la_ctab         ds      1               ; perceptual signed cosine table
+la_mcos11       ds      1               ; $7ff000: perceptual cosine index bits - last fixed word
 la_sqlog        ds      1               ; scratch: square log sample
 la_rmul         ds      1               ; scratch: resonance sign multiplier
 la_rlog         ds      1               ; scratch
@@ -118,11 +123,15 @@ la_k7           ds      1               ; (resonanceWaveLengthFactor >> 4) << 7
 la_b3           ds      1               ; start of the negative half, S4 units
 la_ampt         ds      1               ; amp>>10 plus the low-cutoff square term
 la_rbase        ds      1               ; amp>>10 + resonance amp subtraction + cutoff term - 4096
-la_panl9        ds      1               ; pan factors << 9
-la_panr9        ds      1
-la_saw          ds      1               ; nonzero selects the sawtooth loop
-la_half0        ds      4               ; per half: sign base, linear length,
-la_half1        ds      4               ;   decay factor << 15, square sign
+la_panl         ds      1               ; pan factors, << 9 exact, << 10 perceptual
+la_panr         ds      1
+la_saw          ds      1               ; nonzero selects a sawtooth loop
+la_kernel       ds      1               ; 0 exact, 1 perceptual
+la_sqbase       ds      1               ; the kernel's FWD square table; ZERO and REV follow
+la_half0        ds      4               ; per half, exact: sign base, linear length,
+la_half1        ds      4               ;   decay << 15, square sign multiplier;
+                                        ; perceptual: linear length, sine table base,
+                                        ;   decay << 15, signed square gain
 
 ; The 256-entry test-tone table is external Y data now, delivered by the P
 ; alias like the LA32 tables, so the boot no longer copies it.
@@ -164,13 +173,23 @@ ssi_buffer_b:
 ;   sign: square negative in the negative half; resonance negative when
 ;         bit 15 of R4 differs from the half; sawtooth adds a cosine log to
 ;         both and flips both signs by bit 19 of WP + 2^18
-;   unlog(v) = interpolateExp(v & 4095) >> (v >> 12): one table gives the
-;              first factor, a second, indexed by the integer part, the
-;              power of two. Munt clamps every log to 65535, which unlogs to
-;              zero; the shift table is zero from integer part 16 upwards and
-;              carries a zero guard word for -1, the lowest the resonance
-;              can reach, so no clamp is needed for the same result.
+;   unlog(v) = interpolateExp(v & 4095) >> (v >> 12)
 ;   out = +/-unlog(square) +/- unlog(resonance); L += (out*panL)>>13, R alike
+;
+; The exact kernel unlogs through two tables: one gives the first factor by
+; the fraction, a second, indexed by the integer part, the power of two. Munt
+; clamps every log to 65535, which unlogs to zero; the power table is zero
+; from integer part 16 upwards and carries a zero guard word for -1, the
+; lowest the resonance can reach, so no clamp is needed for the same result.
+;
+; The perceptual kernel factors each component instead: the square is a
+; linear sine table entry times a per-block gain 2^(-AMPT/4096), the
+; resonance a signed linear sine entry (sign in bit 10 of its index, the
+; half's sign in the choice of a second table copy 1024 words up) times a
+; gain read from one 4096-entry table by the top twelve bits of the rest of
+; its log, and the sawtooth cosine multiplies their sum. That is one lookup
+; and one multiply where the exact kernel needs two lookups, a multiply-
+; accumulate and a sign multiply per component.
 ;
 ; Register contract on entry, set by command_profile: r3 = la_half0,
 ; r4/r5/r7 = FWD/ZERO/REV square tables, r6 = output, x0 = step, every m
@@ -237,10 +256,10 @@ la32_square_loop:
         move    b1,r1                    ; r1 = fraction = unlog table address
         move    a1,x0
         move    y:<la_shtab,a
-        mac     x0,y0,a x:(r1),x0        ; a1 = shift entry address; x0 = unlog(frac)<<8
+        mac     x0,y0,a x:(r1),x0        ; a1 = power entry address; x0 = unlog(frac)<<8
         move    a1,r2
         move    y:<la_rmul,y0
-        move    y:(r2),x1                ; 2^(15 - integer part), or 0
+        move    x:(r2),x1                ; 2^(15 - integer part), or 0
         mpy     x0,x1,a                  ; a1 = magnitude
         move    a1,x0
         mpy     x0,y0,b
@@ -253,14 +272,14 @@ la32_square_loop:
         move    y:<la_shtab,a
         mac     x0,y0,a x:(r1),x0
         move    a1,r2
-        move    y:<la_panl9,y0
-        move    y:(r2),x1
+        move    y:<la_panl,y0
+        move    x:(r2),x1
         mpy     x0,x1,a
         move    a1,x0
         mac     x0,y1,b                  ; b = (+/-m_sq +/- m_res) * 2^23
 ; pan into the interleaved accumulation buffer; reload the step for the next frame
         asl     b
-        asl     b       y:<la_panr9,y1   ; b1 = 2 * sample
+        asl     b       y:<la_panr,y1    ; b1 = 2 * sample
         move    b1,x0
         move    x:(r6),a
         mac     x0,y0,a
@@ -350,7 +369,7 @@ la32_saw_loop:
         mac     x0,y0,a x:(r1),x0
         move    a1,r2
         move    y:<la_rmul,y0
-        move    y:(r2),x1
+        move    x:(r2),x1
         mpy     x0,x1,a
         move    a1,x0
         mpy     x0,y0,b
@@ -362,13 +381,13 @@ la32_saw_loop:
         move    y:<la_shtab,a
         mac     x0,y0,a x:(r1),x0
         move    a1,r2
-        move    y:<la_panl9,y0
-        move    y:(r2),x1
+        move    y:<la_panl,y0
+        move    x:(r2),x1
         mpy     x0,x1,a
         move    a1,x0
         mac     x0,y1,b
         asl     b
-        asl     b       y:<la_panr9,y1
+        asl     b       y:<la_panr,y1
         move    b1,x0
         move    x:(r6),a
         mac     x0,y0,a
@@ -377,6 +396,145 @@ la32_saw_loop:
         mac     x0,y1,a y:<la_step3,x0
         move    a1,x:(r6)+
 la32_saw_done:
+        rts
+
+; Perceptual kernel. Positions, segments and the resonance's log-domain rest
+; (decay, window, amp base) are computed exactly as above; the record holds
+; the linear length, the half's signed sine table base, the decay factor and
+; the signed square gain.
+la32_psquare_run:
+        move    y:<la_step3,x0
+        do      #LA32_PROFILE_FRAMES,la32_psquare_done
+la32_psquare_loop:
+; phase advance
+        move    y:<la_wp3,a
+        add     x0,a    y:<la_wphmask,x0
+        move    a1,y:<la_wp3
+        and     x0,a    y:<la_k7,y0
+        move    a1,x0
+        mpy     x0,y0,a y:<la_b3,x0
+        asl     a       y:<la_rec1,r1    ; a1 = S4; r1 = half 1 record
+; half: b = R4, r1 = that half's record
+        tfr     a,b
+        sub     x0,b    y:<la_2p14,x0
+        tlt     a,b     r3,r1
+        move    b1,y1                    ; y1 = R4
+; segment within the half: a = position inside a sine segment, r2 = table
+        move    r4,r2
+        tfr     y1,a    y:(r1)+,x1       ; x1 = linear length; r1 -> sine table base
+        tfr     y1,b    y:<la_sh5,y0
+        sub     x0,b
+        tge     b,a     r5,r2
+        sub     x1,b
+        tge     b,a     r7,r2
+; table addresses: n2 = square sine index, r0 = signed resonance sine; x0 = R4
+        move    a1,x0
+        mpy     x0,y0,a y:<la_m511,x1
+        and     x1,a    y1,x0            ; a1 = square index; x0 = R4
+        move    a1,n2
+        tfr     y1,b    y:<la_mffe0,x1
+        and     x1,b    y:(r1)+,a        ; b1 = R4 & $ffe0; a1 = the half's table base; r1 -> decay
+        move    b1,x1
+        mac     x1,y0,a                  ; a1 = base + ((R4 >> 5) & 2047)
+        move    a1,r0
+; square component and the rest of the resonance log
+        move    l:(r2+n2),b              ; b1 = linear sine * 4 or full scale; b0 = window log
+        move    y:(r1)+,y1               ; y1 = decay << 15; r1 -> square gain
+        move    y:<la_rbase,a
+        mac     x0,y1,a y:(r1),y1        ; a1 = rbase + (R4 * decay) >> 8; y1 = signed square gain
+        move    b0,x1
+        add     x1,a    y:<la_m65535,x1  ; a1 = rest of the resonance log
+        move    b1,x0
+        mpy     x0,y1,b y:<la_sh4,y0     ; b1 = square component; y0 = 2^19
+; resonance component: gain[rest >> 4] times the signed sine
+        cmp     x1,a
+        tgt     x1,a                     ; the gain table ends at 65535
+        move    a1,x0
+        move    y:<la_gtab,a
+        mac     x0,y0,a y:(r0),x1        ; a1 = gain entry address; x1 = signed sine * 4
+        move    a1,r1
+        move    y:<la_panl,y0
+        move    y:(r1),x0                ; x0 = gain, Q21
+        mac     x0,x1,b                  ; b1 = sample
+; pan into the interleaved accumulation buffer; reload the step for the next frame
+        move    b1,x0
+        move    x:(r6),a
+        mac     x0,y0,a y:<la_panr,y1
+        move    a1,x:(r6)+
+        move    x:(r6),a
+        mac     x0,y1,a y:<la_step3,x0
+        move    a1,x:(r6)+
+la32_psquare_done:
+        rts
+
+la32_psaw_run:
+        move    y:<la_step3,x0
+        do      #LA32_PROFILE_FRAMES,la32_psaw_done
+la32_psaw_loop:
+        move    y:<la_wp3,a
+        add     x0,a    y:<la_wphmask,x0
+        move    a1,y:<la_wp3
+        and     x0,a    y:<la_k7,y0
+        move    a1,x0
+        mpy     x0,y0,a y:<la_b3,x0
+        asl     a       y:<la_rec1,r1
+        tfr     a,b
+        sub     x0,b    y:<la_2p14,x0
+        tlt     a,b     r3,r1
+        move    b1,y1
+        move    r4,r2
+        tfr     y1,a    y:(r1)+,x1
+        tfr     y1,b    y:<la_sh5,y0
+        sub     x0,b
+        tge     b,a     r5,r2
+        sub     x1,b
+        tge     b,a     r7,r2
+        move    a1,x0
+        mpy     x0,y0,a y:<la_m511,x1
+        and     x1,a    y1,x0
+        move    a1,n2
+        tfr     y1,b    y:<la_mffe0,x1
+        and     x1,b    y:(r1)+,a
+        move    b1,x1
+        mac     x1,y0,a
+        move    a1,r0
+        move    l:(r2+n2),b
+        move    y:(r1)+,y1
+        move    y:<la_rbase,a
+        mac     x0,y1,a y:(r1),y1
+        move    b0,x1
+        add     x1,a    y:<la_m65535,x1
+        move    b1,x0
+        mpy     x0,y1,b y:<la_sh4,y0
+        cmp     x1,a
+        tgt     x1,a
+        move    a1,x0
+        move    y:<la_gtab,a
+        mac     x0,y0,a y:(r0),x1
+        move    a1,r1
+        move    y:<la_panl,y0
+        move    y:(r1),x0
+        mac     x0,x1,b                  ; b1 = square + resonance
+; sawtooth: the signed cosine multiplies the sum
+        move    y:<la_wp3,a
+        move    y:<la_pos21,x1
+        add     x1,a    y:<la_mcos11,x1
+        and     x1,a    y:<la_sh12,y0    ; a1 = cosine position bits 12-22
+        move    a1,x1
+        move    y:<la_ctab,a
+        mac     x1,y0,a                  ; a1 = cosine entry address
+        move    a1,r0
+        move    b1,x0                    ; x0 = sum
+        move    x:(r0),y1                ; y1 = signed cosine * 1024
+        mpy     x0,y1,b y:<la_panl,y0    ; b1 = sum * cosine / 8192
+        move    b1,x0
+        move    x:(r6),a
+        mac     x0,y0,a y:<la_panr,y1
+        move    a1,x:(r6)+
+        move    x:(r6),a
+        mac     x0,y1,a y:<la_step3,x0
+        move    a1,x:(r6)+
+la32_psaw_done:
         rts
 
 ; -----------------------------------------------------------------------------
@@ -489,16 +647,19 @@ command_query_periods:
 ; LA32 profile spike: MT32_CMD_PROFILE_PARTIAL
 ; -----------------------------------------------------------------------------
 
-; Install the selected configuration, clear the output buffer, render, fold
-; the buffer into a checksum and reply with it. The render loops carry the
-; profiler's start and end labels; everything here is outside the bracket.
+; Install the selected run's configuration, clear the output buffer, render
+; with the kernel and wave the configuration names, fold the buffer into a
+; checksum and reply with it. The render loops carry the profiler's start
+; and end labels; everything here is outside the bracket.
 command_profile:
         move    y:last_command,a
         move    #>$0000ff,x0
         and     x0,a
         move    a1,b
         rep     #4
-        asl     b                       ; configuration index * 16
+        asl     b                       ; run index * 16 ...
+        add     a,b
+        add     a,b                     ; ... + 2: LA32_CONFIG_WORDS words per run
         move    #>la32_cfg_image,x0
         add     x0,b
         move    b1,r0
@@ -527,10 +688,18 @@ command_profile_cleared:
         move    #>-1,m6
         move    #>-1,m7
         move    #<la_half0,r3
-        move    #>LA32_SQUARE_FWD,r4
-        move    #>LA32_SQUARE_ZERO,r5
-        move    #>LA32_SQUARE_REV,r7
+        ; the kernel's square tables: FWD, then ZERO and REV 512 words apart
+        move    y:<la_sqbase,a
+        move    #>512,x0
+        move    a1,r4
+        add     x0,a
+        move    a1,r5
+        add     x0,a
+        move    a1,r7
         move    #>LA32_OUTPUT_BASE,r6
+        move    y:<la_kernel,a
+        tst     a
+        jne     command_profile_perceptual
         move    y:<la_saw,a
         tst     a
         jne     command_profile_saw
@@ -538,6 +707,15 @@ command_profile_cleared:
         jmp     command_profile_fold
 command_profile_saw:
         jsr     la32_saw_run
+        jmp     command_profile_fold
+command_profile_perceptual:
+        move    y:<la_saw,a
+        tst     a
+        jne     command_profile_psaw
+        jsr     la32_psquare_run
+        jmp     command_profile_fold
+command_profile_psaw:
+        jsr     la32_psaw_run
 command_profile_fold:
         move    #>LA32_OUTPUT_BASE,r6
         move    #>LA32_OUTPUT_WORDS,x0

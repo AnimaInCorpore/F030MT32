@@ -135,12 +135,12 @@ limit, non-P sections, and sections outside 16-bit P memory.
 | --- | --- | --- |
 | P | `$0000-$003f` | reset and interrupt vectors |
 | P | `$0040-$007f` | reserved for the transient stage-two loader |
-| P | `$0080-$01ff` | internal: the two LA32 partial render loops |
+| P | `$0080-$01ff` | internal: the four LA32 partial render loops |
 | P | `$0200-$05ff` | external: command loop, transport, profile command |
-| P | `$0700-$07ff` | LA32 constant and configuration images |
+| P | `$0700-$07ff` | LA32 constant and run configuration images |
 | P | `$0800-$08ff` | test-tone table image, aliased to `Y:$0800` |
-| P | `$3000-$35ff`, `$3600-$3a3f`, `$3c00-$3fff` | LA32 window, power and resonance tables, aliased to the same Y addresses |
-| P | `$4000-$4fff`, `$7000-$75ff` | LA32 exponent and square value tables, aliased to `X:$0000` and `X:$3000` |
+| P | `$0900-$3bff` | LA32 Y tables — gain, resonance, windows, signed sine — aliased to the same Y addresses |
+| P | `$4000-$4fff`, `$6000-$783f` | LA32 X tables — exponent, square values, cosine, power — aliased to `X:$0000` and `X:$2000` upwards |
 | X | `$0000-$00ff` | internal: first page of the exponent table, copied from P at boot |
 | Y | `$0000-$003f` | internal: scalar transport state, LA32 constants and configuration |
 | X | `$1000-$13ff` | external: period buffer A, and the profile spike's output |
@@ -244,7 +244,8 @@ Only this much runs:
 - Falcon sound-matrix setup and restoration on every exit path;
 - a Hatari smoke gate that scores the whole sequence from the emulator's own
   host-port and XBIOS traces;
-- one LA32 synth partial with block-held controls, bit-exact against Munt,
+- one LA32 synth partial with block-held controls in two kernels, one
+  bit-exact against Munt and one perceptual within a few output words of it,
   rendered on command into a buffer for the profiler and the oracle
   comparison — a measurement, not a voice: it has no envelopes, no pitch
   updates, no allocation, and it never reaches the codec.

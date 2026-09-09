@@ -28,19 +28,22 @@ feasibility spike that decides how much of one fits:
 - a 68030 program that boots the DSP, runs both sources, reports the codec
   frame and period counters, and restores the sound system on every exit path;
 - the build system, the Hatari smoke gate, and the documented contracts;
-- one LA32 synth partial on the DSP, bit-exact against Munt's integer model
-  with its controls held per block, with the native oracle and the
-  Hatari profiling harness that measure it (`make profile-partials`).
+- one LA32 synth partial on the DSP in two kernels — one bit-exact against
+  Munt's integer model with its controls held per block, one perceptual —
+  with the native oracle and the Hatari profiling harness that measure
+  both (`make profile-partials`).
 
 Of the three questions that decide whether the project is possible, the first
 is answered and the answer is hard:
 
-1. **One exact LA32 partial costs 77 DSP cycles per codec frame as a square
-   wave and 100 as a sawtooth**, against a budget of 489.40 per frame. After
-   the transport, the reverb and the block-rate control take their share,
-   that is four or five partials on the DSP — one or two timbres at a time,
-   not a nine-part module. A perceptual partial could reach about 60 cycles;
-   it cannot reach the 15 that thirty-two partials would need. See
+1. **One LA32 partial costs 77 DSP cycles per codec frame as a square wave
+   and 100 as a sawtooth when it reproduces Munt bit for bit, and 53 and 64
+   when it leaves the log domain through single-table lookups within a few
+   output words of Munt**, against a budget of 489.40 per frame. After the
+   transport, the reverb and the block-rate control take their share, that
+   is six or seven perceptual partials on the DSP — a few timbres at a time,
+   not a nine-part module — and nothing that keeps the LA32's wave shape
+   can reach the 15 cycles that thirty-two partials would need. See
    [`docs/la32-budget.md`](docs/la32-budget.md).
 2. **The PCM ROM does not fit and never will.** It is 262,144 samples against
    32,768 words of Falcon DSP SRAM. The proposed answer — the 68030 renders
@@ -114,8 +117,8 @@ make check
 | `make check` | build everything and validate the generated artefacts | DOSBox |
 | `make smoke` | score boot and transport under Hatari | Hatari |
 | `make oracle` | build the native Munt LA32 partial oracle | C++17 |
-| `make profile-partial CFG=n` | render configuration `n` (0-3) of one LA32 partial on the DSP, check it word for word against the oracle, and report its cycle cost | Hatari |
-| `make profile-partials` | the same for every configuration | Hatari |
+| `make profile-partial CFG=n` | render run `n` of one LA32 partial on the DSP and report its cycle cost: runs 0-3 are the exact kernel, checked word for word against the oracle, runs 4-7 the perceptual kernel on the same configurations, checked against error bounds | Hatari |
+| `make profile-partials` | the same for every run | Hatari |
 | `make verbose` | build the traced bring-up executable | DOSBox |
 | `make run` | launch the self-test executable in Hatari | Hatari |
 
@@ -181,18 +184,20 @@ The intended contracts, in the order they have to be established:
 2. **Feasibility.** Measured DSP cycles for one LA32 partial, the reverb, and
    the transport against the 489.40-cycle frame budget, before any synthesis
    is committed to. The partial is measured: `make profile-partials` renders
-   four configurations, requires each to equal Munt's output word for word,
-   and reports 77 and 100 cycles per frame. The reverb and the transport are
-   not yet.
+   four configurations with each kernel, requires the exact kernel to equal
+   Munt's output word for word and the perceptual one to stay within its
+   error bounds, and reports 77 and 100 cycles per frame for the former, 53
+   and 64 for the latter. The reverb and the transport are not yet.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the
    production renderer — the same two-tier split F030MXDRV uses against
-   MAME/ymfm.
+   MAME/ymfm. Both tiers exist for the wave generator alone; see the bounds
+   in `tools/la32_partial.py`.
 
 ## Repository map
 
 - `src/dsp/la32.asm`: scaffold DSP kernel — protocol, codec transport, test
-  tone, and the bit-exact LA32 partial behind the profile spike.
+  tone, and the exact and perceptual LA32 partials behind the profile spike.
 - `src/dsp/stage2_loader.asm`: sparse embedded P-memory loader.
 - `src/dsp/protocol.inc`, `src/m68k/protocol.i`: the one host/DSP contract in two syntaxes.
 - `src/m68k/main.s`: Falcon bootstrap, sound matrix, self-test, bring-up and profile modes.

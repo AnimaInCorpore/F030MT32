@@ -104,9 +104,10 @@ help:
 	@echo "  oracle     build the native Munt LA32 partial oracle"
 	@echo "  profile-partial CFG=n"
 	@echo "             profile one LA32 synth partial under Hatari and check"
-	@echo "             its output against the oracle (configurations 0-3)"
+	@echo "             its output against the oracle: runs 0-3 are the exact"
+	@echo "             kernel, 4-7 the perceptual one, same configurations"
 	@echo "  profile-partials"
-	@echo "             the same for every configuration"
+	@echo "             the same for every run"
 	@echo "  clean      remove generated build/ and release/ directories"
 	@echo
 	@echo "The DSP step needs DOSBox for Motorola's ASM56000 and a C++17"
@@ -336,7 +337,7 @@ LA32_PROFILE_REFERENCE = $(LA32_REFERENCE_DIR)/la32-partial-$(CFG).txt
 
 profile-partial: check tools/profile_dsp.py tools/la32_partial.py
 	$(call require_hatari,profile-partial)
-	@test -n "$(CFG)" || { echo "error: profile-partial needs CFG=0..3" >&2; exit 1; }
+	@test -n "$(CFG)" || { echo "error: profile-partial needs CFG=0..7" >&2; exit 1; }
 	@rm -rf $(LA32_PROFILE_RUN)
 	@mkdir -p $(LA32_PROFILE_RUN) $(LA32_REFERENCE_DIR)
 	@$(LA32_ORACLE) $$(python3 tools/la32_partial.py oracle-args $(CFG)) \
@@ -372,8 +373,12 @@ profile-partial: check tools/profile_dsp.py tools/la32_partial.py
 	@python3 tools/la32_partial.py compare \
 		--dump $(LA32_PROFILE_RUN)/debug.log \
 		--oracle $(LA32_PROFILE_REFERENCE) $(CFG)
-	@rg -q "Transfer 0x$$(python3 tools/la32_partial.py expected-checksum \
-		--oracle $(LA32_PROFILE_REFERENCE))" $(LA32_PROFILE_RUN)/trace.txt
+	# The exact kernel's reply must also carry the oracle's checksum through
+	# the host port; the perceptual kernel's buffer differs by design.
+	@if [ "$$(python3 tools/la32_partial.py kernel $(CFG))" = exact ]; then \
+		rg -q "Transfer 0x$$(python3 tools/la32_partial.py expected-checksum \
+			--oracle $(LA32_PROFILE_REFERENCE))" $(LA32_PROFILE_RUN)/trace.txt; \
+	fi
 	@python3 tools/profile_dsp.py report \
 		--listing $(DSP_BUILD)/LA32.LST \
 		--profile $(LA32_PROFILE_RUN)/profile.txt \
