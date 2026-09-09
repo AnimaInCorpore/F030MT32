@@ -32,7 +32,8 @@ feasibility spike that decides how much of one fits:
   Munt's integer model with its controls held per block, one perceptual —
   and the Boss reverb, bit-exact, in a second DSP image, with the native
   oracle and the Hatari profiling harness that measure all of them
-  (`make profile-partials`).
+  (`make profile-partials`), and a transport profile that sorts whole
+  host-fed periods by what the DSP was doing (`make profile-transport`).
 
 Of the three questions that decide whether the project is possible, the first
 is answered and the answer is hard:
@@ -40,12 +41,13 @@ is answered and the answer is hard:
 1. **One LA32 partial costs 77 DSP cycles per codec frame as a square wave
    and 100 as a sawtooth when it reproduces Munt bit for bit, and 53 and 64
    when it leaves the log domain through single-table lookups within a few
-   output words of Munt; the reverb costs 92**, against a budget of 489.40
-   per frame. After the transport, the reverb and the block-rate control
-   take their share, that is five or six perceptual partials on the DSP — a
-   few timbres at a time, not a nine-part module — and nothing that keeps
-   the LA32's wave shape can reach the 15 cycles that thirty-two partials
-   would need. See [`docs/la32-budget.md`](docs/la32-budget.md).
+   output words of Munt; the reverb costs 92 and the transport 12**,
+   against a budget of 489.40 per frame. After the transport, the reverb
+   and the block-rate control take their share, that is six perceptual
+   partials on the DSP, give or take one by wave — a few timbres at a time,
+   not a nine-part module — and nothing that keeps the LA32's wave shape
+   can reach the 15 cycles that thirty-two partials would need. See
+   [`docs/la32-budget.md`](docs/la32-budget.md).
 2. **The PCM ROM does not fit and never will.** It is 262,144 samples against
    32,768 words of Falcon DSP SRAM. The proposed answer — the 68030 renders
    PCM partials and streams the result, exactly as F030MXDRV streams decoded
@@ -120,6 +122,7 @@ make check
 | `make oracle` | build the native Munt LA32 partial oracle | C++17 |
 | `make profile-partial CFG=n` | render run `n` on the DSP and report its cycle cost: runs 0-3 are the exact LA32 partial, checked word for word against the oracle, runs 4-7 the perceptual kernel on the same configurations, checked against error bounds, runs 8-9 the Boss reverb over run 1, word for word | Hatari |
 | `make profile-partials` | the same for every run | Hatari |
+| `make profile-transport` | profile 24 whole host-fed periods of the self-test and sort every DSP cycle into the SSI interrupt, the receive, the once-per-period work and the waits | Hatari |
 | `make verbose` | build the traced bring-up executable | DOSBox |
 | `make run` | launch the self-test executable in Hatari | Hatari |
 
@@ -190,8 +193,11 @@ The intended contracts, in the order they have to be established:
    kernel and the reverb at two settings, requires the exact kernels to
    equal Munt's output word for word and the perceptual one to stay within
    its error bounds, and reports 77 and 100 cycles per frame for the exact
-   partial, 53 and 64 for the perceptual one, 92 for the reverb. The
-   transport is not measured yet.
+   partial, 53 and 64 for the perceptual one, 92 for the reverb.
+   `make profile-transport` measures the transport across whole host-fed
+   periods: 20 cycles per frame of DSP work with the scaffold's polled
+   receive, 12 with a receive by interrupt, and 59 more stalled on the
+   68030 as long as the receive polls.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the
    production renderer — the same two-tier split F030MXDRV uses against
@@ -210,7 +216,9 @@ The intended contracts, in the order they have to be established:
 - `src/m68k/dsp_link.s`: paced host/DSP transfer.
 - `tools/la32_partial_oracle.cpp`, `tools/la32_partial.py`: the Munt LA32
   oracle, the DSP table and configuration generator, and the word-for-word
-  comparison; `tools/profile_dsp.py` drives Hatari's DSP profiler.
+  comparison; `tools/profile_dsp.py` drives Hatari's DSP profiler and
+  `tools/profile_transport.py` sorts a whole-period profile of the
+  transport into work, stall and idle.
 - `tools/`: also the DSP build driver, stage-two image generator and
   tone-table generator.
 - `docs/`: architecture, MT-32 and MIDI ground truth, DSP and emulator notes.

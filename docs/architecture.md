@@ -240,6 +240,17 @@ later: F030MXDRV's measurements show the receive moving into the boundary wait
 changes where the cycles are *counted*, not just when they are spent, and every
 occupancy figure depends on which model is in force.
 
+One part of it will not transfer unchanged. `make profile-transport` measures
+the scaffold's polled receive at 7 DSP cycles of its own per word plus 29
+stalled on the 68030, which delivers a word every 2.27 µs under the
+calibrated host-port model; F030MXDRV hides that stall in a boundary wait
+that its synthesis leaves idle. Five LA32 partials and the reverb leave no
+such idle, so the production kernel takes the host's words through the host
+receive interrupt, the same two-instruction fast interrupt as the SSI's at
+the same measured 3 cycles per word, and gives up an address register to it
+the way `r6` belongs to the SSI. See
+[`la32-budget.md`](la32-budget.md#the-transport).
+
 ## Implemented
 
 Only this much runs:

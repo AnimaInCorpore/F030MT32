@@ -41,6 +41,9 @@ LA32_TABLE_DUMP := $(GENERATED_BUILD)/la32_tables.txt
 LA32_TABLES := $(GENERATED_BUILD)/la32tabs.inc
 LA32_REVERB_TABLES := $(GENERATED_BUILD)/la32rvb.inc
 LA32_PROFILE_DIR := build/la32-profile
+TRANSPORT_PROFILE_DIR := build/transport-profile
+TRANSPORT_PROFILE_SKIP := 4
+TRANSPORT_PROFILE_PERIODS := 24
 LA32_REFERENCE_DIR := build/reference
 LA32_REVERB_INPUT := $(LA32_REFERENCE_DIR)/la32-partial-1.txt
 CXX ?= g++
@@ -95,7 +98,7 @@ endef
 DOSBOX_FLAGS ?= --noprimaryconf --set output=texture
 
 .PHONY: all help host dsp reference check smoke run verbose clean tools \
-	oracle profile-partial profile-partials
+	oracle profile-partial profile-partials profile-transport
 
 all: host dsp
 
@@ -113,6 +116,9 @@ help:
 	@echo "             4-7 the perceptual one, 8-9 the Boss reverb over run 1"
 	@echo "  profile-partials"
 	@echo "             the same for every run"
+	@echo "  profile-transport"
+	@echo "             measure the codec transport's cost per frame across"
+	@echo "             whole host-fed periods of the self-test under Hatari"
 	@echo "  clean      remove generated build/ and release/ directories"
 	@echo
 	@echo "The DSP step needs DOSBox for Motorola's ASM56000 and a C++17"
@@ -428,6 +434,42 @@ profile-partials:
 	@for cfg in $$(seq 0 $$(( $$(python3 tools/la32_partial.py count) - 1 ))); do \
 		$(MAKE) --no-print-directory profile-partial CFG=$$cfg || exit 1; \
 	done
+
+# Cost the transport: arm the DSP profiler at a refill of the self-test's
+# host-fed stream, save it whole periods later, and sort every cycle the DSP
+# spent into the SSI interrupt, the receive, the once-per-period work and
+# the waits. The self-test needs no PROFILE.CFG.
+profile-transport: check tools/profile_transport.py tools/profile_dsp.py
+	$(call require_hatari,profile-transport)
+	@rm -rf $(TRANSPORT_PROFILE_DIR) $(RELEASE_DIR)/PROFILE.CFG
+	@mkdir -p $(TRANSPORT_PROFILE_DIR)
+	@python3 tools/profile_transport.py prepare \
+		--listing $(DSP_BUILD)/LA32.LST \
+		--output-dir $(TRANSPORT_PROFILE_DIR) \
+		--skip $(TRANSPORT_PROFILE_SKIP) --periods $(TRANSPORT_PROFILE_PERIODS)
+	@cd $(RELEASE_DIR) && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(HATARI) \
+		--machine falcon --dsp emu \
+		--tos $(CURDIR)/$(TOS_ROM) --patch-tos true \
+		--fast-boot true --fast-forward true --sound off \
+		--confirm-quit false --run-vbls 1200 \
+		--trace-file $(CURDIR)/$(TRANSPORT_PROFILE_DIR)/trace.txt \
+		--trace dsp_host_interface \
+		--parse $(CURDIR)/$(TRANSPORT_PROFILE_DIR)/start.ini \
+		f030mt32.tos \
+		> $(CURDIR)/$(TRANSPORT_PROFILE_DIR)/debug.log 2>&1 || { \
+			tail -n 60 $(CURDIR)/$(TRANSPORT_PROFILE_DIR)/debug.log >&2; \
+			exit 1; \
+		}
+	@test -s $(TRANSPORT_PROFILE_DIR)/profile.txt || { \
+		echo "error: Hatari did not capture the transport profile" >&2; \
+		tail -n 60 $(TRANSPORT_PROFILE_DIR)/debug.log >&2; \
+		exit 1; \
+	}
+	@python3 tools/profile_transport.py report \
+		--listing $(DSP_BUILD)/LA32.LST \
+		--profile $(TRANSPORT_PROFILE_DIR)/profile.txt \
+		--output $(TRANSPORT_PROFILE_DIR)/report.txt \
+		--periods $(TRANSPORT_PROFILE_PERIODS)
 
 run: all
 	$(call require_hatari,run)

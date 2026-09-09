@@ -9,8 +9,10 @@ listed at the bottom have started, and their numbers are the headline:
 > frame as a square wave and 100 as a sawtooth when it reproduces Munt's
 > integer model bit for bit, and 53 and 64 when it leaves the log domain
 > through single-table lookups within one or two output words of that model.
-> The Boss reverb costs 92 cycles per frame, bit for bit.** All measured
-> under the DSP-calibrated Hatari on 2026-09-09 (`make profile-partials`).
+> The Boss reverb costs 92 cycles per frame, bit for bit. The codec
+> transport costs 12 when the DSP takes the host's words by interrupt, and
+> the SSI interrupt is 6 of them.** All measured under the DSP-calibrated
+> Hatari on 2026-09-09 (`make profile-partials`, `make profile-transport`).
 
 Everything below the measurement section is arithmetic that follows from it.
 F030MXDRV remains the cautionary precedent: its first feasibility guess was an
@@ -46,7 +48,9 @@ with amp, pitch and cutoff held constant, which is exactly how a block-rate
 production kernel would present them between control updates, and the Boss
 reverb over one partial's output. Each partial kernel pan-mixes into an
 interleaved stereo accumulation buffer the way `Partial::produceAndMixSample`
-does; the reverb processes the buffer in place.
+does; the reverb processes the buffer in place. A fourth probe profiles the
+transport itself: whole periods of the self-test's host-fed stream, with
+every cycle sorted by what the DSP was doing (`make profile-transport`).
 
 The output is checked, not auditioned. `tools/la32_partial_oracle.cpp` drives
 Munt's own `LA32IntPartialPair` and `BReverbModel` with the same parameters,
@@ -223,6 +227,54 @@ modulo addressing for a compare-and-wrap of about three cycles per line.
 The tap-delay mode is one 16,003-word line and cheaper to run, but needs a
 16,384-aligned block, which only X:$0000 offers.
 
+### The transport
+
+`make profile-transport` arms the profiler at the fourth refill of the
+self-test's host-fed stream and saves it 24 refills later, so the window is
+24 whole periods, 12,288 frames, with every cycle the DSP spent in them
+sorted by what it was doing. The window measures exactly its own real time,
+1.000 times the codec budget, which is the check that the profiler saw all
+of it. Unlike the bracketed profiles above, this one depends on the
+calibrated build: the stall and the idle are paced by the 68030 and the
+codec.
+
+| Per codec frame | Cycles | What it is |
+| --- | ---: | --- |
+| SSI transmit interrupt | 5.99 | two fast interrupts of 3 cycles per stereo frame |
+| Host-port receive, DSP work | 14.00 | 7 per word for two words: poll, read, store |
+| Commands, replies and handoff | 0.15 | 77 cycles per period |
+| **Transport, DSP work** | **20.15** | 4.1 % of the budget |
+| Stalled on the host port | 58.85 | the receive poll spinning between words |
+| Transmitter drain | 0.45 | 228 cycles per handoff, waiting for the SSI to take a word |
+| Idle | 409.95 | the boundary spin: nothing to render |
+
+Two numbers matter beyond the 20. The 68030 delivers a word every 36.4 DSP
+cycles, 2.27 µs, under the calibrated host-port model: its paced blast of a
+1,024-word period takes 2.33 ms of the 15.62 ms period on the host side,
+and on the DSP side the polled receive spends 59 cycles per frame waiting
+for the next word. The scaffold can afford that because it has nothing else
+to do. A kernel running five partials and the reverb cannot, and it has no
+idle time to hide the receive in, as F030MXDRV's early-accept boundary wait
+does. The production kernel therefore takes the host's words through the
+host receive interrupt, which is the same two-instruction fast interrupt as
+the SSI's and costs the same 3 cycles per word, 6 per frame for a stereo
+PCM mix and 3 for a mono one, at the price of an address register held for
+the receive the way r6 is held for the SSI. The transport's fixed cost is
+then:
+
+| Transport with an interrupt receive | Cycles/frame |
+| --- | ---: |
+| SSI transmit interrupt | 6.0 |
+| host receive interrupt, 1,024 words per period | 6.0 |
+| commands, replies and handoff | 0.2 |
+| **total** | **12.1** |
+
+Hatari charges a fast interrupt as its two instructions and nothing for the
+pipeline; if the hardware adds a cycle per interrupt, the total rises by
+about 4. The estimate this page carried before the measurement, "about
+15", was right within that uncertainty, and it is the only fixed cost that
+was.
+
 ## The arithmetic that follows
 
 489.40 cycles per frame, divided by the per-partial cost, with nothing else
@@ -230,26 +282,27 @@ running; and nothing else running is not an option:
 
 | Fixed cost per frame | Cycles | Basis |
 | --- | ---: | --- |
-| SSI interrupt and transport | about 15 | F030MXDRV, measured on production material |
+| Codec transport, receive by interrupt | 12 | measured, this page |
 | Boss reverb, room mode | 92 | measured, this page |
 | Per-block control, amortized | about 20 | envelope, ramp and pitch updates every 32 frames |
-| **Left for partials** | **about 362** | |
+| **Left for partials** | **about 365** | |
 
 | Kernel | Square | Sawtooth |
 | --- | ---: | ---: |
 | exact, of 489 | 6.3 | 4.9 |
-| exact, of 362 | 4.7 | 3.6 |
+| exact, of 365 | 4.7 | 3.7 |
 | perceptual, of 489 | 9.2 | 7.6 |
-| perceptual, of 362 | 6.8 | 5.7 |
+| perceptual, of 365 | 6.9 | 5.7 |
 
-That is **five or six perceptual partials, three or four exact ones**, and
-the MT-32's factory timbres lean on sawtooth partials for most sustained
-sounds. A Falcon MT-32 built from these kernels is a five-partial machine
-before the 68030's PCM partials are counted — a few timbres at a time, not a
-nine-part module. The threshold this page named before any measurement,
-"more than about 60 cycles per partial makes it a four-partial machine", is
-met by the exact kernel and only just escaped by the perceptual one, and the
-reverb turned out half again as expensive as assumed.
+That is **six perceptual partials, give or take one by wave, and three or
+four exact ones**, and the MT-32's factory timbres lean on sawtooth partials
+for most sustained sounds. A Falcon MT-32 built from these kernels is a
+five- or six-partial machine before the 68030's PCM partials are counted —
+a few timbres at a time, not a nine-part module. The threshold this page
+named before any measurement, "more than about 60 cycles per partial makes
+it a four-partial machine", is met by the exact kernel and only just
+escaped by the perceptual one; the reverb turned out half again as
+expensive as assumed and the transport as cheap as assumed.
 
 ## The levers, in the order they should be tried
 
@@ -265,6 +318,10 @@ the starting condition, and the partial itself is close to its floor.
    [`architecture.md`](architecture.md#the-pcm-rom-problem) — and the
    measurement makes the 68030 the more important half: the number of PCM
    partials it can carry now decides more of the machine than the DSP does.
+   Its own transport cost is known now: feeding the DSP a stereo period
+   takes 2.33 ms of every 15.62 ms, so about 13 ms of 68030 time per period
+   remain for PCM rendering, MIDI and control, and a mono PCM mix would
+   give back half of the 2.33.
 3. **A cheaper reverb.** The reverb is now the largest single item after the
    partials themselves. Its clip, its dry and wet scalings and its exact
    floors are the price of matching Munt word for word; a perceptual reverb
@@ -290,7 +347,7 @@ absolute one: 262,144 samples against 32,768 words of SRAM.
 
 ## The experiments that would settle this
 
-Each of these is small. They are listed in dependency order; the first three
+Each of these is small. They are listed in dependency order; the first four
 are done.
 
 1. ~~**Cost one synth partial.**~~ Done: 77 and 100 cycles per frame,
@@ -300,13 +357,15 @@ are done.
    reproduces it, with the graded gate described above.
 3. ~~**Cost the reverb.**~~ Done: 92 cycles per frame, bit-exact, in the
    room mode. `make profile-partial CFG=8..9` reproduces it.
-4. **Cost the transport.** The scaffold already runs; bracketing
-   `receive_period` and the handoff gives the fixed overhead that comes off
-   the top of the budget before any synthesis.
+4. ~~**Cost the transport.**~~ Done: 20 cycles per frame of DSP work with
+   the scaffold's polled receive, 12 with a receive by interrupt, and the
+   polled receive stalls 59 more on the 68030, which delivers a word every
+   2.27 µs. `make profile-transport` reproduces it.
 5. **Cost a 68030 PCM partial.** Resample-and-amp one looping ROM wave into a
-   512-frame period and time it against the 15.62 ms budget. This decides how
-   many PCM partials the host half can carry, which after these measurements
-   is the larger of the two ceilings.
+   512-frame period and time it against the 13 ms of the period the host
+   has left after feeding the DSP. This decides how many PCM partials the
+   host half can carry, which after these measurements is the larger of the
+   two ceilings.
 6. **Find the control rate.** With one partial working, hold its envelopes
    and LFO across 1, 8, 32 and 64 frames and compare against the oracle.
 
