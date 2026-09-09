@@ -1,0 +1,7 @@
+# native sample   midi bytes
+# One sustained A440 on part 1 with the default power-on patch. The simplest
+# fixture that produces sound: it fixes the file format and gives the future
+# oracle harness a first target. Timestamps are native 32,000 Hz samples.
+0                 c0 00
+0                 90 45 64
+64000             80 45 40

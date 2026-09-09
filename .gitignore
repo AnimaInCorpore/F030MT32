@@ -1,0 +1,16 @@
+/build/
+/release/
+/roms/
+/.claude/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Scratch captures and debug dumps that the emulator and capture helpers drop
+# beside the sources. Anchored at the root: committed images live in
+# subdirectories, which the leading / does not reach.
+/*.png
+/*.ppm
+/hatari.out.txt
+/hatari.err.txt
+/*-dbg.txt
