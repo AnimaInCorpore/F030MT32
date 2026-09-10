@@ -11,8 +11,11 @@ listed at the bottom have started, and their numbers are the headline:
 > through single-table lookups within one or two output words of that model.
 > The Boss reverb costs 92 cycles per frame, bit for bit. The codec
 > transport costs 12 when the DSP takes the host's words by interrupt, and
-> the SSI interrupt is 6 of them.** All measured under the DSP-calibrated
-> Hatari on 2026-09-09 (`make profile-partials`, `make profile-transport`).
+> the SSI interrupt is 6 of them. One PCM partial on the 68030 costs 4.67 ms
+> of every 15.62 ms period bit for bit and 3.89 ms perceptually, so the
+> host carries three PCM partials beside the DSP's six.** All measured under
+> the DSP-calibrated Hatari on 2026-09-09 (`make profile-partials`,
+> `make profile-transport`, `make profile-pcms`).
 
 Everything below the measurement section is arithmetic that follows from it.
 F030MXDRV remains the cautionary precedent: its first feasibility guess was an
@@ -51,6 +54,9 @@ interleaved stereo accumulation buffer the way `Partial::produceAndMixSample`
 does; the reverb processes the buffer in place. A fourth probe profiles the
 transport itself: whole periods of the self-test's host-fed stream, with
 every cycle sorted by what the DSP was doing (`make profile-transport`).
+The fifth leaves the DSP: the 68030 renders one PCM partial, the kind of
+partial the DSP can never hold, and Hatari's CPU profiler brackets it
+(`make profile-pcms`).
 
 The output is checked, not auditioned. `tools/la32_partial_oracle.cpp` drives
 Munt's own `LA32IntPartialPair` and `BReverbModel` with the same parameters,
@@ -275,6 +281,84 @@ about 4. The estimate this page carried before the measurement, "about
 15", was right within that uncertainty, and it is the only fixed cost that
 was.
 
+### A PCM partial on the 68030
+
+The PCM ROM's 262,144 samples can never sit in the DSP's 32K words, so the
+plan renders PCM partials on the 68030 and streams their mix to the DSP
+once per period ([`architecture.md`](architecture.md#the-pcm-rom-problem)).
+`src/m68k/pcm_partial.s` is that renderer, twice: an exact kernel that
+reproduces Munt's integer PCM model word for word, and a perceptual one.
+Both hold amp, pitch and pan constant, render into the interleaved stereo
+buffer of zero-padded 24-bit words the paced blast sends, and are driven
+by `tools/pcm_partial.py`, which also feeds Munt's `LA32IntPartialPair`
+the same wave through the oracle and grades the file the program writes.
+
+The waves are synthetic, in the PCM ROM's own word format: a looped
+2,048-sample wave of eight harmonics with a little noise, the ROM's shortest
+length, and a 4,096-sample one-shot burst that ends inside the run. Four
+configurations cover steps of 0.75, 1.5, 2.25 and 0.31 samples per frame,
+so most frames reuse a pair, every frame takes a new pair, the one-shot
+wave ends after 1,820 frames, and each pair lasts three frames.
+
+The exact model per frame, from `generateNextPCMWaveLogSamples` and
+`unlogAndMixWGOutput`: the ROM word becomes a log value by arithmetic, the
+amp term is added and the sum clamped, the neighbouring word likewise, both
+leave the log domain, and the pair is interpolated in the linear domain by
+the seven-bit fraction of the position before the pan factors mix it. The
+68030 kernel does the two unlogs through one signed 131,072-word table
+indexed by sign and log, built once at start, so a table read replaces the
+shift and the sign test; the ROM is stored with its half-log clamped to
+fifteen bits, which loses nothing an unlog can see. The perceptual kernel
+keeps each wave in linear form, built once through the same table, and
+applies amp and pan together as one Q13 factor per channel, so the amp's
+log-domain rounding is traded for the multiply's.
+
+Every run of the exact kernel equals the oracle word for word, and every
+perceptual run stays within one or two words of it, an RMS error of -87
+to -93 dB of full scale:
+
+| Kernel | Cycles/frame | Instructions/frame | Per period | Of the 15.62 ms |
+| --- | ---: | ---: | ---: | ---: |
+| exact | 146.4 | 36 | 4.67 ms | 29.9 % |
+| perceptual | 122.0 | 26 | 3.89 ms | 24.9 % |
+
+The cost is the same for every configuration to within half a cycle: the
+kernels are branch-poor and the wave, step and amp only change which
+words they read. The program also counts the 200 Hz system tick around
+its timed render and prints it, so the same run measures itself on
+hardware; under Hatari the ticks give 4.69 and 3.91 ms per period.
+
+Per frame, exact kernel, as Hatari attributes the cycles:
+
+| Stage | Cycles | What it is |
+| --- | ---: | --- |
+| Position, sample index, two ROM words | 17 | |
+| Log, amp term, clamp, two unlog reads | 20 | |
+| Interpolation | 32 | factor, one word multiply, shift, add |
+| Advance and wrap | 6 | |
+| Pan | 49 | two word multiplies and shifts |
+| Two stores to ST-RAM | 19 | |
+| Loop | 3 | |
+
+The perceptual kernel drops the twenty cycles of log arithmetic and
+unlogging and keeps everything else, because everything else is the
+floor: three word multiplies at about 22 cycles each are 66 of its 122
+cycles, and the two long stores to ST-RAM another 19. A 16 MHz 68030 is a
+poor resampler, and the interpolation and the pan are what a PCM partial
+is. Mixing all of a part's PCM partials on one bus before panning would
+save the two pan multiplies per partial beyond the first of a part, which
+is the only lever left in the loop.
+
+Two things the emulator cannot settle. Hatari charges a word multiply 22
+cycles where the 68030 manual's cache case says 28, and the reads and
+stores depend on the Falcon's ST-RAM timing and the Videl's bus slots,
+which the calibrated build models rather than measures; the hardware
+figure is probably five to ten percent higher, and the printed tick count
+is how to find out. And the measurement is of the kernel alone: a host
+that also parses MIDI, runs every partial's envelopes and allocation, and
+updates the DSP's controls each block spends part of its period on that
+before any PCM partial is rendered.
+
 ## The arithmetic that follows
 
 489.40 cycles per frame, divided by the per-partial cost, with nothing else
@@ -296,13 +380,30 @@ running; and nothing else running is not an option:
 
 That is **six perceptual partials, give or take one by wave, and three or
 four exact ones**, and the MT-32's factory timbres lean on sawtooth partials
-for most sustained sounds. A Falcon MT-32 built from these kernels is a
-five- or six-partial machine before the 68030's PCM partials are counted —
-a few timbres at a time, not a nine-part module. The threshold this page
-named before any measurement, "more than about 60 cycles per partial makes
-it a four-partial machine", is met by the exact kernel and only just
-escaped by the perceptual one; the reverb turned out half again as
-expensive as assumed and the transport as cheap as assumed.
+for most sustained sounds. The threshold this page named before any
+measurement, "more than about 60 cycles per partial makes it a
+four-partial machine", is met by the exact kernel and only just escaped by
+the perceptual one; the reverb turned out half again as expensive as
+assumed and the transport as cheap as assumed.
+
+The host has its own budget, and it is smaller:
+
+| 68030, per 15.62 ms period | Milliseconds | Basis |
+| --- | ---: | --- |
+| Feeding the DSP a stereo period | 2.33 | measured, the transport |
+| MIDI, envelopes, allocation, control updates | not measured | |
+| **Left for PCM partials** | **at most 13.29** | |
+
+| Kernel | Per partial | PCM partials |
+| --- | ---: | ---: |
+| exact | 4.67 ms | 2.8 |
+| perceptual | 3.89 ms | 3.4 |
+
+A Falcon MT-32 built from these kernels is therefore **six synth partials
+on the DSP and three PCM partials on the 68030** — a few timbres at a time,
+not a nine-part module — and the PCM side is the tighter of the two,
+because most of the MT-32's characteristic timbres open with a PCM partial
+and three of them sound at most three such notes at once.
 
 ## The levers, in the order they should be tried
 
@@ -315,13 +416,14 @@ the starting condition, and the partial itself is close to its floor.
    `TVA`, `TVF` and `TVP` do a few dozen integer operations each per event,
    so it is unlikely to matter next to the partial itself.
 2. **Move work to the 68030.** PCM partials have to move anyway — see
-   [`architecture.md`](architecture.md#the-pcm-rom-problem) — and the
-   measurement makes the 68030 the more important half: the number of PCM
-   partials it can carry now decides more of the machine than the DSP does.
-   Its own transport cost is known now: feeding the DSP a stereo period
-   takes 2.33 ms of every 15.62 ms, so about 13 ms of 68030 time per period
-   remain for PCM rendering, MIDI and control, and a mono PCM mix would
-   give back half of the 2.33.
+   [`architecture.md`](architecture.md#the-pcm-rom-problem) — and now that
+   the host is measured too, there is nothing to move: it is full at three
+   PCM partials, and every synth partial moved there would cost more than
+   a PCM one. The levers on the host side are small: blind host-port
+   writes, which TOS's own block transfer already relies on, would cut the
+   2.33 ms of feeding the DSP to about 1.5; a mono PCM mix panned on the
+   DSP would halve it again; and mixing a part's PCM partials before
+   panning saves two of the three multiplies per additional partial.
 3. **A cheaper reverb.** The reverb is now the largest single item after the
    partials themselves. Its clip, its dry and wet scalings and its exact
    floors are the price of matching Munt word for word; a perceptual reverb
@@ -347,7 +449,7 @@ absolute one: 262,144 samples against 32,768 words of SRAM.
 
 ## The experiments that would settle this
 
-Each of these is small. They are listed in dependency order; the first four
+Each of these is small. They are listed in dependency order; the first five
 are done.
 
 1. ~~**Cost one synth partial.**~~ Done: 77 and 100 cycles per frame,
@@ -361,11 +463,10 @@ are done.
    the scaffold's polled receive, 12 with a receive by interrupt, and the
    polled receive stalls 59 more on the 68030, which delivers a word every
    2.27 µs. `make profile-transport` reproduces it.
-5. **Cost a 68030 PCM partial.** Resample-and-amp one looping ROM wave into a
-   512-frame period and time it against the 13 ms of the period the host
-   has left after feeding the DSP. This decides how many PCM partials the
-   host half can carry, which after these measurements is the larger of the
-   two ceilings.
+5. ~~**Cost a 68030 PCM partial.**~~ Done: 4.67 ms per period bit-exact
+   and 3.89 ms perceptually, against the 13.29 ms left after the
+   transport, so three PCM partials. `make profile-pcm CFG=0..7` reproduces
+   it, and the program's own tick count repeats it on hardware.
 6. **Find the control rate.** With one partial working, hold its envelopes
    and LFO across 1, 8, 32 and 64 frames and compare against the oracle.
 
@@ -383,7 +484,10 @@ disappointment:
 
 The first condition is met by the exact model and skirted by the perceptual
 one: 53 to 64 cycles and a 92-cycle reverb buy five or six partials, not
-eight. The project is therefore only worth continuing as a deliberately
-reduced machine — the perceptual partial, a handful of DSP partials, and as
-many 68030 PCM partials as the host budget allows — and the second
-condition, still unmeasured, decides whether even that is worth having.
+eight. The second is measured now as well: the host carries three PCM
+partials, and the sounds the MT-32 is remembered for open with one each.
+The project is therefore only worth continuing as a deliberately reduced
+machine — the perceptual partials, six on the DSP and three on the 68030,
+a few timbres at a time — and whether a three-note MT-32 is worth having
+is a question about the music it would be asked to play, not about the
+Falcon, which has now been measured on every axis this page named.

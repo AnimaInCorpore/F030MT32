@@ -33,10 +33,14 @@ feasibility spike that decides how much of one fits:
   and the Boss reverb, bit-exact, in a second DSP image, with the native
   oracle and the Hatari profiling harness that measure all of them
   (`make profile-partials`), and a transport profile that sorts whole
-  host-fed periods by what the DSP was doing (`make profile-transport`).
+  host-fed periods by what the DSP was doing (`make profile-transport`);
+- one PCM partial on the 68030, again in an exact and a perceptual kernel,
+  checked against Munt from the file the program writes and timed by
+  Hatari's CPU profiler and by the program's own tick count
+  (`make profile-pcms`).
 
 Of the three questions that decide whether the project is possible, the first
-is answered and the answer is hard:
+two are answered and the answers are hard:
 
 1. **One LA32 partial costs 77 DSP cycles per codec frame as a square wave
    and 100 as a sawtooth when it reproduces Munt bit for bit, and 53 and 64
@@ -48,11 +52,15 @@ is answered and the answer is hard:
    not a nine-part module — and nothing that keeps the LA32's wave shape
    can reach the 15 cycles that thirty-two partials would need. See
    [`docs/la32-budget.md`](docs/la32-budget.md).
-2. **The PCM ROM does not fit and never will.** It is 262,144 samples against
-   32,768 words of Falcon DSP SRAM. The proposed answer — the 68030 renders
-   PCM partials and streams the result, exactly as F030MXDRV streams decoded
-   PDX ADPCM — is written down but not built or measured, and after the first
-   measurement it is the host's capacity that decides most of the machine.
+2. **The PCM ROM does not fit and never will, and the 68030 carries three
+   PCM partials.** The ROM is 262,144 samples against 32,768 words of
+   Falcon DSP SRAM, so the 68030 renders PCM partials and streams the
+   result, exactly as F030MXDRV streams decoded PDX ADPCM. Measured, one
+   such partial costs 4.67 ms of every 15.62 ms period bit for bit and
+   3.89 ms perceptually, and feeding the DSP costs 2.33 ms more, so the
+   host holds three of them before it parses a byte of MIDI. Together with
+   the DSP's six synth partials that is the machine: a few timbres at a
+   time.
 3. **The oracle harness exists for the wave generator only.** Munt is
    vendored under `third_party/munt`; `tools/la32_partial_oracle.cpp` drives
    its LA32 model and `tools/la32_partial.py` compares the DSP's output with
@@ -123,6 +131,8 @@ make check
 | `make profile-partial CFG=n` | render run `n` on the DSP and report its cycle cost: runs 0-3 are the exact LA32 partial, checked word for word against the oracle, runs 4-7 the perceptual kernel on the same configurations, checked against error bounds, runs 8-9 the Boss reverb over run 1, word for word | Hatari |
 | `make profile-partials` | the same for every run | Hatari |
 | `make profile-transport` | profile 24 whole host-fed periods of the self-test and sort every DSP cycle into the SSI interrupt, the receive, the once-per-period work and the waits | Hatari |
+| `make profile-pcm CFG=n` | render one PCM partial on the 68030, check it against the oracle and report its cost per period: runs 0-3 the exact kernel, 4-7 the perceptual one | Hatari |
+| `make profile-pcms` | the same for every PCM run | Hatari |
 | `make verbose` | build the traced bring-up executable | DOSBox |
 | `make run` | launch the self-test executable in Hatari | Hatari |
 
@@ -153,10 +163,12 @@ F030MT32.TTP STREAM    hold the host-fed square wave until a keypress
 ```
 
 Only the first letter of the tail is examined, so `T` and `tone` also work and
-anything else falls back to the self-test. A one-digit `PROFILE.CFG` beside
-the program selects the LA32 profile spike for that configuration instead,
-which is how `make profile-partial` drives it: Hatari's autostart carries no
-command tail.
+anything else falls back to the self-test. A `PROFILE.CFG` beside the program
+selects a profile spike instead, which is how the profile targets drive it,
+because Hatari's autostart carries no command tail: one digit runs that
+LA32 configuration on the DSP, `P` and a digit renders that PCM run on the
+68030, writes its frames to `PCMOUT.BIN` and prints how many 200 Hz ticks
+the timed render took — on a real Falcon as well as under Hatari.
 
 Counters that stay at zero mean the SSI never clocked — the failure mode
 F030MXDRV chased onto real hardware and eventually traced to Port C pins left
@@ -197,7 +209,10 @@ The intended contracts, in the order they have to be established:
    `make profile-transport` measures the transport across whole host-fed
    periods: 20 cycles per frame of DSP work with the scaffold's polled
    receive, 12 with a receive by interrupt, and 59 more stalled on the
-   68030 as long as the receive polls.
+   68030 as long as the receive polls. `make profile-pcms` measures the
+   host's half: 4.67 ms per period for an exact PCM partial, 3.89 for a
+   perceptual one, both checked against Munt from the file the program
+   writes.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the
    production renderer — the same two-tier split F030MXDRV uses against
@@ -214,11 +229,14 @@ The intended contracts, in the order they have to be established:
 - `src/dsp/protocol.inc`, `src/m68k/protocol.i`: the one host/DSP contract in two syntaxes.
 - `src/m68k/main.s`: Falcon bootstrap, sound matrix, self-test, bring-up and profile modes.
 - `src/m68k/dsp_link.s`: paced host/DSP transfer.
+- `src/m68k/pcm_partial.s`: the exact and perceptual PCM partial kernels
+  behind the 68030 spike.
 - `tools/la32_partial_oracle.cpp`, `tools/la32_partial.py`: the Munt LA32
   oracle, the DSP table and configuration generator, and the word-for-word
-  comparison; `tools/profile_dsp.py` drives Hatari's DSP profiler and
-  `tools/profile_transport.py` sorts a whole-period profile of the
-  transport into work, stall and idle.
+  comparison; `tools/pcm_partial.py` does the same for the 68030 PCM runs
+  and reads their CPU profile; `tools/profile_dsp.py` drives Hatari's DSP
+  profiler and `tools/profile_transport.py` sorts a whole-period profile
+  of the transport into work, stall and idle.
 - `tools/`: also the DSP build driver, stage-two image generator and
   tone-table generator.
 - `docs/`: architecture, MT-32 and MIDI ground truth, DSP and emulator notes.

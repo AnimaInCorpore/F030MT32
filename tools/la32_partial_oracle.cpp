@@ -8,13 +8,16 @@
 // uses, so tools/la32_partial.py derives the DSP tables from identical data.
 // `reverb TIME LEVEL` reads such frames from standard input and runs their
 // left/right pair through Munt's BReverbModel in its MT-32 room mode,
-// printing the wet output in the same three-column shape.
+// printing the wet output in the same three-column shape. `pcm` reads a
+// wave in the PCM ROM's word format from standard input and renders one
+// PCM partial from it, the model the 68030 spike reproduces.
 //
 // Build-time reference only; nothing from here runs on the Falcon.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "BReverbModel.h"
 #include "Enumerations.h"
@@ -27,8 +30,39 @@ static void usage() {
 	fprintf(stderr,
 		"usage: la32_partial_oracle --dump-tables\n"
 		"       la32_partial_oracle render SAW PULSEWIDTH RESONANCE AMP PITCH CUTOFF FRAMES PANL PANR\n"
-		"       la32_partial_oracle reverb TIME LEVEL < frames\n");
+		"       la32_partial_oracle reverb TIME LEVEL < frames\n"
+		"       la32_partial_oracle pcm LENGTH LOOPED AMP PITCH FRAMES PANL PANR < wave\n");
 	exit(2);
+}
+
+// One PCM partial, the master of a pair with the slave silent, so the wave
+// is interpolated the way every PCM partial outside a ring-modulated
+// structure is. The wave arrives as the 16-bit words Synth::loadPCMROM
+// leaves in pcmROMData, one per line.
+static int runPCM(const Tables &tables, unsigned length, bool looped, Bit32u amp, Bit16u pitch,
+		unsigned frames, int panLeft, int panRight) {
+	std::vector<Bit16s> wave(length);
+	for (unsigned i = 0; i < length; i++) {
+		int word;
+		if (scanf("%d", &word) != 1) {
+			fprintf(stderr, "la32_partial_oracle: the wave has fewer than %u words\n", length);
+			return 1;
+		}
+		wave[i] = Bit16s(word);
+	}
+	LA32IntPartialPair::initTables(tables);
+	LA32IntPartialPair pair;
+	pair.init(false, false);
+	pair.initPCM(LA32PartialPair::MASTER, wave.data(), length, looped);
+	pair.deactivate(LA32PartialPair::SLAVE);
+	for (unsigned i = 0; i < frames; i++) {
+		pair.generateNextSample(LA32PartialPair::MASTER, amp, pitch, 0);
+		const Bit16s sample = pair.nextOutSample();
+		const int left = (int(sample) * panLeft) >> 13;
+		const int right = (int(sample) * panRight) >> 13;
+		printf("%d %d %d\n", int(sample), left, right);
+	}
+	return 0;
 }
 
 static int runReverb(unsigned time, unsigned level) {
@@ -55,6 +89,17 @@ int main(int argc, char **argv) {
 		const unsigned level = strtoul(argv[3], NULL, 0);
 		if (time > 7 || level > 7) usage();
 		return runReverb(time, level);
+	}
+	if (argc == 9 && strcmp(argv[1], "pcm") == 0) {
+		const unsigned length = strtoul(argv[2], NULL, 0);
+		const bool looped = atoi(argv[3]) != 0;
+		const Bit32u amp = Bit32u(strtoul(argv[4], NULL, 0));
+		const Bit16u pitch = Bit16u(strtoul(argv[5], NULL, 0));
+		const unsigned frames = strtoul(argv[6], NULL, 0);
+		const int panLeft = atoi(argv[7]);
+		const int panRight = atoi(argv[8]);
+		if (length == 0 || length > 262144 || pitch > 59392) usage();
+		return runPCM(tables, length, looped, amp, pitch, frames, panLeft, panRight);
 	}
 	if (argc == 2 && strcmp(argv[1], "--dump-tables") == 0) {
 		printf("exp9");

@@ -217,6 +217,15 @@ partials, and the structure pairs that ring-modulate a PCM partial with a synth
 partial straddle the split. Those two cases are the reason this is a proposal
 and not a decision.
 
+Its cost is measured (`make profile-pcms`, [`la32-budget.md`](la32-budget.md#a-pcm-partial-on-the-68030)):
+one PCM partial rendered bit-exactly against Munt costs the 68030 4.67 ms
+of every 15.62 ms period, a perceptual kernel 3.89 ms, and feeding the DSP
+a stereo period 2.33 ms more, so the host holds three PCM partials with
+nothing else running. Three word multiplies at about 22 cycles each and two
+long stores to ST-RAM are three quarters of the kernel's 122 cycles per
+frame, which is why no cheaper renderer is in sight: the interpolation and
+the pan are what a PCM partial is.
+
 ## Producer/consumer pipelining
 
 The scaffold's host loop is synchronous: `command_refill_stream` receives a
@@ -269,7 +278,11 @@ Only this much runs:
   updates, no allocation, and it never reaches the codec;
 - the Boss reverb in the MT-32's room mode, bit-exact against Munt, run on
   command over a buffer of input frames in a second DSP image — again a
-  measurement: it processes a fixed buffer, not the codec stream.
+  measurement: it processes a fixed buffer, not the codec stream;
+- one PCM partial on the 68030 from a synthetic wave in the ROM's word
+  format, in an exact and a perceptual kernel, rendered to a file for the
+  oracle comparison and timed between two host-port markers — a
+  measurement of the host's half of the split, not a voice.
 
 No MIDI, no ROM handling, no envelopes, and no oracle beyond the wave
-generator and the reverb.
+generator, the PCM partial and the reverb.

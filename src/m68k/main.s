@@ -32,6 +32,10 @@ MODE_SELFTEST   equ     0
 MODE_TONE       equ     1
 MODE_STREAM     equ     2
 MODE_PROFILE    equ     3
+MODE_PCM        equ     4
+
+PCM_CFG_BYTES   equ     40              ; tools/pcm_partial.py config_longs
+PCM_OUTPUT_BYTES equ    20+8*PCM_PROFILE_FRAMES
 
 ; Self-test durations. Long enough that a stalled SSI clock is unmistakable in
 ; the frame counter, short enough for a non-interactive emulator run.
@@ -114,11 +118,13 @@ start_image_known:
         bne     protocol_failed
         Cconws  dsp_ready_text
 
-        ; The profile spike never touches the codec, so it runs before the
-        ; sound matrix is claimed and exits without restoring anything.
+        ; The profile spikes never touch the codec, so they run before the
+        ; sound matrix is claimed and exit without restoring anything.
         move.l  run_mode,d0
         cmpi.l  #MODE_PROFILE,d0
         beq     dispatch_profile
+        cmpi.l  #MODE_PCM,d0
+        beq     dispatch_pcm
 
         bsr     sound_open
         tst.l   d0
@@ -165,6 +171,13 @@ dispatch_profile:
         Cconws  done_text
         Pterm0
 
+dispatch_pcm:
+        bsr     run_pcm
+        tst.l   d0
+        bne     pcm_failed
+        Cconws  done_text
+        Pterm0
+
 ; -----------------------------------------------------------------------------
 ; LA32 profile spike
 ; -----------------------------------------------------------------------------
@@ -191,22 +204,117 @@ run_profile_failed:
         moveq   #-1,d0
         rts
 
-; Hatari's autostart cannot pass a command tail, so a one-digit PROFILE.CFG
-; beside the program selects the spike the way F030MXDRV's AUTOPLAY.INF
-; selects a song. Absent, unreadable or out of range means the self-test.
-; out: d0.l = MODE_PROFILE with profile_cfg set, or MODE_SELFTEST
+; -----------------------------------------------------------------------------
+; 68030 PCM partial spike
+; -----------------------------------------------------------------------------
+
+; Render the selected run twice: once for the oracle comparison, into the
+; buffer the file carries, and then period after period between the two
+; marker PINGs that bracket the Hatari CPU profiler, with the 200 Hz system
+; tick counted around the timed render so the same program measures itself
+; on hardware. tools/pcm_partial.py reads the file and the profile.
+; out: d0.l = 0 on success
+run_pcm:
+        bsr     pcm_prepare
+        move.l  profile_cfg,d0
+        mulu.w  #PCM_CFG_BYTES,d0
+        lea     pcm_cfg_image,a0
+        adda.l  d0,a0
+        move.l  a0,pcm_run_config
+
+        clr.l   pcm_position
+        clr.l   pcm_ended
+        lea     pcm_output,a1
+        move.l  #PCM_PROFILE_FRAMES,d0
+        bsr     pcm_render
+
+        move.l  #MT32_PCM_MARKER_BEGIN,d0
+        or.l    profile_cfg,d0
+        bsr     dsp_exchange
+        cmp.l   #MT32_REPLY_HELLO,d0
+        bne     run_pcm_failed
+        Supexec read_hz200
+        move.l  d0,d7
+        move.w  #PCM_TIMING_PERIODS-1,d6
+run_pcm_timing:
+        ; Every timed period starts the wave over, so a one-shot wave is
+        ; rendered rather than silenced, and a looped one is unaffected.
+        clr.l   pcm_position
+        clr.l   pcm_ended
+        movea.l pcm_run_config,a0
+        lea     pcm_scratch,a1
+        move.l  #MT32_PERIOD_FRAMES,d0
+        bsr     pcm_render
+        dbra    d6,run_pcm_timing
+        Supexec read_hz200
+        sub.l   d7,d0
+        move.l  d0,pcm_output_header+12
+        move.l  #MT32_PCM_MARKER_END,d0
+        or.l    profile_cfg,d0
+        bsr     dsp_exchange
+        cmp.l   #MT32_REPLY_HELLO,d0
+        bne     run_pcm_failed
+
+        move.l  #'PCM1',pcm_output_header
+        move.l  #PCM_PROFILE_FRAMES,pcm_output_header+4
+        move.l  #PCM_TIMING_PERIODS,pcm_output_header+8
+        move.l  profile_cfg,pcm_output_header+16
+        Fcreate pcm_output_name,#0
+        tst.l   d0
+        bmi.s   run_pcm_failed
+        move.w  d0,d7
+        Fwrite  d7,#PCM_OUTPUT_BYTES,pcm_output_header
+        move.l  d0,d6
+        Fclose  d7
+        cmpi.l  #PCM_OUTPUT_BYTES,d6
+        bne.s   run_pcm_failed
+        move.l  pcm_output_header+12,d0
+        lea     txt_pcm_ticks,a0
+        bsr     report_value
+        moveq   #0,d0
+        rts
+run_pcm_failed:
+        moveq   #-1,d0
+        rts
+
+; The TOS 200 Hz tick, supervisor only; run through Supexec.
+read_hz200:
+        move.l  $4ba.w,d0
+        rts
+
+; Hatari's autostart cannot pass a command tail, so a PROFILE.CFG beside the
+; program selects a spike the way F030MXDRV's AUTOPLAY.INF selects a song:
+; one digit for the DSP runs, P and a digit for the 68030 PCM runs. Absent,
+; unreadable or out of range means the self-test.
+; out: d0.l = MODE_PROFILE or MODE_PCM with profile_cfg set, or MODE_SELFTEST
 read_profile_cfg:
         Fopen   profile_cfg_name,#0
         tst.l   d0
         bmi.s   read_profile_cfg_none
         move.w  d0,d7                   ; handle; GEMDOS preserves d3-d7
-        Fread   d7,#1,profile_cfg_byte
+        Fread   d7,#2,profile_cfg_bytes
         move.l  d0,d6
         Fclose  d7
-        subq.l  #1,d6
+        tst.l   d6
+        ble.s   read_profile_cfg_none
+        moveq   #0,d0
+        move.b  profile_cfg_bytes,d0
+        andi.b  #$df,d0
+        cmpi.b  #'P',d0
+        bne.s   read_profile_cfg_dsp
+        cmpi.l  #2,d6
         bne.s   read_profile_cfg_none
         moveq   #0,d0
-        move.b  profile_cfg_byte,d0
+        move.b  profile_cfg_bytes+1,d0
+        subi.b  #'0',d0
+        cmpi.b  #PCM_PROFILE_CONFIGS-1,d0
+        bhi.s   read_profile_cfg_none
+        move.l  d0,profile_cfg
+        moveq   #MODE_PCM,d0
+        rts
+read_profile_cfg_dsp:
+        moveq   #0,d0
+        move.b  profile_cfg_bytes,d0
         subi.b  #'0',d0
         cmpi.b  #LA32_PROFILE_CONFIGS-1,d0
         bhi.s   read_profile_cfg_none
@@ -539,6 +647,9 @@ audio_failed:
         bra.s   fail_exit
 profile_failed:
         Cconws  profile_error_text
+        bra.s   fail_exit
+pcm_failed:
+        Cconws  pcm_error_text
 fail_exit:
         bsr     sound_close
         move.w  #1,-(sp)
@@ -619,8 +730,12 @@ txt_stream_periods:
         dc.b    'stream periods     ',0
 txt_profile_checksum:
         dc.b    'partial checksum   ',0
+txt_pcm_ticks:
+        dc.b    'pcm 200 Hz ticks   ',0
 profile_cfg_name:
         dc.b    'PROFILE.CFG',0
+pcm_output_name:
+        dc.b    'PCMOUT.BIN',0
 reserve_error_text:
         dc.b    'Dsp_Reserve failed',13,10,0
 load_error_text:
@@ -633,6 +748,8 @@ audio_error_text:
         dc.b    'audio transport failed',13,10,0
 profile_error_text:
         dc.b    'LA32 profile spike failed',13,10,0
+pcm_error_text:
+        dc.b    'PCM partial spike failed',13,10,0
         even
 
 ; The generated DSP image closes the data section, as in F030MXDRV. A TOS
@@ -658,8 +775,10 @@ dsp_image_ptr:
         ds.l    1
 dsp_image_words:
         ds.l    1
-profile_cfg_byte:
-        ds.b    1
+pcm_run_config:
+        ds.l    1
+profile_cfg_bytes:
+        ds.b    2
         even
 old_left_atten:
         ds.w    1

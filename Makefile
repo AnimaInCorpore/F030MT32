@@ -48,9 +48,15 @@ LA32_REFERENCE_DIR := build/reference
 LA32_REVERB_INPUT := $(LA32_REFERENCE_DIR)/la32-partial-1.txt
 CXX ?= g++
 
+# 68030 PCM partial spike: its tables and runs come from the same oracle
+# table dump (see tools/pcm_partial.py).
+PCM_TABLES := $(GENERATED_BUILD)/pcmtabs.i
+PCM_PROFILE_DIR := build/pcm-profile
+
 M68K_SOURCES := \
 	src/m68k/main.s \
-	src/m68k/dsp_link.s
+	src/m68k/dsp_link.s \
+	src/m68k/pcm_partial.s
 M68K_OBJECTS := $(patsubst src/m68k/%.s,$(M68K_BUILD)/%.o,$(M68K_SOURCES))
 VERBOSE_M68K_BUILD := build/m68k-verbose
 VERBOSE_M68K_OBJECTS := $(patsubst src/m68k/%.s,$(VERBOSE_M68K_BUILD)/%.o,$(M68K_SOURCES))
@@ -98,7 +104,8 @@ endef
 DOSBOX_FLAGS ?= --noprimaryconf --set output=texture
 
 .PHONY: all help host dsp reference check smoke run verbose clean tools \
-	oracle profile-partial profile-partials profile-transport
+	oracle profile-partial profile-partials profile-transport \
+	profile-pcm profile-pcms
 
 all: host dsp
 
@@ -119,6 +126,12 @@ help:
 	@echo "  profile-transport"
 	@echo "             measure the codec transport's cost per frame across"
 	@echo "             whole host-fed periods of the self-test under Hatari"
+	@echo "  profile-pcm CFG=n"
+	@echo "             render one PCM partial on the 68030 under Hatari, check"
+	@echo "             it against the oracle and report its cost per period:"
+	@echo "             runs 0-3 the exact kernel, 4-7 the perceptual one"
+	@echo "  profile-pcms"
+	@echo "             the same for every PCM run"
 	@echo "  clean      remove generated build/ and release/ directories"
 	@echo
 	@echo "The DSP step needs DOSBox for Motorola's ASM56000 and a C++17"
@@ -133,7 +146,7 @@ host: $(RELEASE_DIR)/f030mt32.tos $(RELEASE_DIR)/f030mt32.ttp
 dsp: $(RELEASE_DIR)/la32.lod $(RELEASE_DIR)/reverb.lod $(DSP_STAGE2_IMAGE) \
 	$(DSP_REVERB_IMAGE)
 
-reference: $(TONE_TABLE) $(LA32_TABLES) $(LA32_REVERB_TABLES)
+reference: $(TONE_TABLE) $(LA32_TABLES) $(LA32_REVERB_TABLES) $(PCM_TABLES)
 
 oracle: $(LA32_ORACLE)
 
@@ -185,6 +198,10 @@ $(LA32_ORACLE): tools/la32_partial_oracle.cpp tools/mt32emu_config/config.h \
 $(LA32_TABLE_DUMP): $(LA32_ORACLE)
 	@mkdir -p $(GENERATED_BUILD)
 	$(LA32_ORACLE) --dump-tables > $@
+
+$(PCM_TABLES): tools/pcm_partial.py tools/la32_partial.py $(LA32_TABLE_DUMP)
+	@mkdir -p $(GENERATED_BUILD)
+	python3 tools/pcm_partial.py tables --tables $(LA32_TABLE_DUMP) > $@
 
 $(LA32_TABLES): tools/la32_partial.py $(LA32_TABLE_DUMP)
 	python3 tools/la32_partial.py tables --tables $(LA32_TABLE_DUMP) > $@
@@ -266,7 +283,8 @@ $(DSP_REVERB_IMAGE): tools/generate_dsp_stage2.py $(DSP_BUILD)/.assembled
 # -----------------------------------------------------------------------------
 
 $(M68K_BUILD)/%.o: src/m68k/%.s src/m68k/xbios.i src/m68k/verbose.i \
-		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(DSP_REVERB_IMAGE) $(VASM)
+		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(DSP_REVERB_IMAGE) \
+		$(PCM_TABLES) $(VASM)
 	@mkdir -p $(M68K_BUILD)
 	$(VASM) $< -quiet -Felf -m68030 -Isrc/m68k -I$(GENERATED_BUILD) \
 		-o $@ -L $(M68K_BUILD)/$*.lst
@@ -284,7 +302,8 @@ $(RELEASE_DIR)/f030mt32.ttp: $(RELEASE_DIR)/f030mt32.tos
 # console. Each step prints its label before the call and its result after, so
 # a hang leaves a dangling label naming the call that never returned.
 $(VERBOSE_M68K_BUILD)/%.o: src/m68k/%.s src/m68k/xbios.i src/m68k/verbose.i \
-		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(DSP_REVERB_IMAGE) $(VASM)
+		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(DSP_REVERB_IMAGE) \
+		$(PCM_TABLES) $(VASM)
 	@mkdir -p $(VERBOSE_M68K_BUILD)
 	$(VASM) $< -quiet -Felf -m68030 -DVERBOSE_BOOT \
 		-Isrc/m68k -I$(GENERATED_BUILD) -o $@ \
@@ -319,6 +338,7 @@ check: all reference
 	@rg -q "^la32_cfg_image:" $(LA32_TABLES)
 	@rg -q "^la32_unlog_image:" $(LA32_TABLES)
 	@rg -q "^la32_reverb_input_image:" $(LA32_REVERB_TABLES)
+	@rg -q "^pcm_cfg_image:" $(PCM_TABLES)
 	# The two protocol headers are one contract in two syntaxes; only their
 	# first line, which names the other file, may differ. Spelled without
 	# process substitution so the recipe works under a plain /bin/sh.
@@ -470,6 +490,65 @@ profile-transport: check tools/profile_transport.py tools/profile_dsp.py
 		--profile $(TRANSPORT_PROFILE_DIR)/profile.txt \
 		--output $(TRANSPORT_PROFILE_DIR)/report.txt \
 		--periods $(TRANSPORT_PROFILE_PERIODS)
+
+# Cost a 68030 PCM partial: the program renders run CFG for the oracle
+# comparison and then period after period between two marker PINGs, which
+# arm and save Hatari's CPU profiler; the Python tool checks the file the
+# program wrote against the oracle and turns the profile into cycles and
+# milliseconds per period. PROFILE.CFG carries P and the run's digit.
+PCM_PROFILE_RUN = $(PCM_PROFILE_DIR)/$(CFG)
+PCM_PROFILE_REFERENCE = $(LA32_REFERENCE_DIR)/pcm-partial-$(CFG).txt
+
+profile-pcm: check tools/pcm_partial.py
+	$(call require_hatari,profile-pcm)
+	@test -n "$(CFG)" || { echo "error: profile-pcm needs CFG=0..7" >&2; exit 1; }
+	@rm -rf $(PCM_PROFILE_RUN) $(RELEASE_DIR)/PCMOUT.BIN
+	@mkdir -p $(PCM_PROFILE_RUN) $(LA32_REFERENCE_DIR)
+	@python3 tools/pcm_partial.py wave $(CFG) > $(PCM_PROFILE_RUN)/wave.txt
+	@$(LA32_ORACLE) $$(python3 tools/pcm_partial.py oracle-args $(CFG)) \
+		< $(PCM_PROFILE_RUN)/wave.txt > $(PCM_PROFILE_REFERENCE)
+	@python3 tools/pcm_partial.py prepare \
+		--listing $(DSP_BUILD)/LA32.LST \
+		--output-dir $(PCM_PROFILE_RUN) $(CFG)
+	@printf 'P$(CFG)' > $(RELEASE_DIR)/PROFILE.CFG
+	@cd $(RELEASE_DIR) && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(HATARI) \
+		--machine falcon --dsp emu --memsize 4 \
+		--tos $(CURDIR)/$(TOS_ROM) --patch-tos true \
+		--fast-boot true --fast-forward true --sound off \
+		--confirm-quit false --run-vbls 1500 \
+		--trace-file $(CURDIR)/$(PCM_PROFILE_RUN)/trace.txt \
+		--trace dsp_host_interface \
+		--parse $(CURDIR)/$(PCM_PROFILE_RUN)/start.ini \
+		f030mt32.tos \
+		> $(CURDIR)/$(PCM_PROFILE_RUN)/debug.log 2>&1 || { \
+			rm -f $(RELEASE_DIR)/PROFILE.CFG; \
+			tail -n 60 $(CURDIR)/$(PCM_PROFILE_RUN)/debug.log >&2; \
+			exit 1; \
+		}
+	@rm -f $(RELEASE_DIR)/PROFILE.CFG
+	@test -s $(PCM_PROFILE_RUN)/profile.txt || { \
+		echo "error: Hatari did not capture the 68030 PCM profile" >&2; \
+		tail -n 60 $(PCM_PROFILE_RUN)/debug.log >&2; \
+		exit 1; \
+	}
+	@test -s $(RELEASE_DIR)/PCMOUT.BIN || { \
+		echo "error: the program did not write PCMOUT.BIN" >&2; \
+		tail -n 60 $(PCM_PROFILE_RUN)/debug.log >&2; \
+		exit 1; \
+	}
+	@mv $(RELEASE_DIR)/PCMOUT.BIN $(PCM_PROFILE_RUN)/pcmout.bin
+	@python3 tools/pcm_partial.py compare \
+		--output $(PCM_PROFILE_RUN)/pcmout.bin \
+		--oracle $(PCM_PROFILE_REFERENCE) $(CFG)
+	@python3 tools/pcm_partial.py report \
+		--profile $(PCM_PROFILE_RUN)/profile.txt \
+		--output $(PCM_PROFILE_RUN)/pcmout.bin \
+		--report $(PCM_PROFILE_RUN)/report.txt $(CFG)
+
+profile-pcms:
+	@for cfg in $$(seq 0 $$(( $$(python3 tools/pcm_partial.py count) - 1 ))); do \
+		$(MAKE) --no-print-directory profile-pcm CFG=$$cfg || exit 1; \
+	done
 
 run: all
 	$(call require_hatari,run)

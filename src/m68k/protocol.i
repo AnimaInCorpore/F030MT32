@@ -31,6 +31,16 @@ LA32_PROFILE_FRAMES equ     2048
 LA32_PROFILE_CONFIGS equ    10
 LA32_PROFILE_FIRST_REVERB equ 8
 
+; 68030 PCM partial spike (docs/la32-budget.md): the host renders one PCM
+; partial itself and writes the checked frames to PCMOUT.BIN; two PINGs
+; carrying these markers, the low byte naming the run, bracket the timed
+; render for the Hatari CPU profiler. The DSP only echoes them.
+MT32_PCM_MARKER_BEGIN equ   $01c100
+MT32_PCM_MARKER_END equ     $01c200
+PCM_PROFILE_CONFIGS equ     8
+PCM_PROFILE_FRAMES equ      2048
+PCM_TIMING_PERIODS equ      128
+
 ; One transport period. 512 stereo frames at the 32,779.947916 Hz codec rate
 ; is 15.62 ms, the same cadence F030MXDRV's production path was calibrated
 ; against; the interleaved buffer is therefore 1024 words and must sit on a
