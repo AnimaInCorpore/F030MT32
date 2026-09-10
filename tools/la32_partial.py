@@ -69,8 +69,9 @@ SHIFT_GUARD = 1
 SHIFT_ENTRIES = 1088
 
 # Internal Y layout, mirrored by src/dsp/la32.asm: la_wp3 at $10, these
-# fixed words from $11, three scratch words, then the CONFIG_WORDS block.
-LA_REC1 = 0x37
+# fixed words from $11, three scratch words, the frame and block counts,
+# then the CONFIG_WORDS block; la_half1 is its last four words.
+LA_REC1 = 0x39
 FIXED_CONSTANTS = [
     ("la_wphmask", 0x7FF800),
     ("la_sh5", 1 << 18),

@@ -10,10 +10,16 @@
 // left/right pair through Munt's BReverbModel in its MT-32 room mode,
 // printing the wet output in the same three-column shape. `pcm` reads a
 // wave in the PCM ROM's word format from standard input and renders one
-// PCM partial from it, the model the 68030 spike reproduces.
+// PCM partial from it, the model the 68030 spike reproduces. `control`
+// drives a synth partial with amp, pitch and cutoff that move the way the
+// MT-32's own control path moves them - LA32Ramp for amp and cutoff, a
+// triangle vibrato at the MCU timer's period for pitch - either per sample
+// or held per block, so the block-rate design can be graded against the
+// per-sample model.
 //
 // Build-time reference only; nothing from here runs on the Falcon.
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +27,7 @@
 
 #include "BReverbModel.h"
 #include "Enumerations.h"
+#include "LA32Ramp.h"
 #include "LA32WaveGenerator.h"
 #include "Tables.h"
 
@@ -31,8 +38,124 @@ static void usage() {
 		"usage: la32_partial_oracle --dump-tables\n"
 		"       la32_partial_oracle render SAW PULSEWIDTH RESONANCE AMP PITCH CUTOFF FRAMES PANL PANR\n"
 		"       la32_partial_oracle reverb TIME LEVEL < frames\n"
-		"       la32_partial_oracle pcm LENGTH LOOPED AMP PITCH FRAMES PANL PANR < wave\n");
+		"       la32_partial_oracle pcm LENGTH LOOPED AMP PITCH FRAMES PANL PANR < wave\n"
+		"       la32_partial_oracle control SAW PULSEWIDTH RESONANCE PANL PANR FRAMES BLOCK MODE\n"
+		"                           BASEPITCH BASECUTOFF LFODEPTH LFOPERIOD < segments\n"
+		"         segments: lines 'a TARGET INCREMENT' and 'c TARGET INCREMENT', each ramp\n"
+		"         starting when the previous one of its kind raises its interrupt;\n"
+		"         MODE letters: A/P/C hold amp/pitch/cutoff per block, R ramps the amp\n"
+		"         linearly across the block, D dumps the per-sample controls instead\n");
 	exit(2);
+}
+
+struct Segment {
+	Bit8u target;
+	Bit8u increment;
+};
+
+// Munt's TVP re-evaluates the pitch every SAMPLE_RATE / 4000 samples plus a
+// random 0..3, the MT-32's MCU timer; this probe keeps the nominal period
+// and drops the jitter so a run is reproducible.
+static const unsigned PITCH_TIMER_SAMPLES = 8;
+
+static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, unsigned resonance,
+		int panLeft, int panRight, unsigned frames, unsigned block, const char *mode,
+		unsigned basePitch, unsigned baseCutoff, int lfoDepth, unsigned lfoPeriod) {
+	std::vector<Segment> ampSegments, cutoffSegments;
+	char kind[8];
+	int target, increment;
+	while (scanf("%7s %d %d", kind, &target, &increment) == 3) {
+		const Segment segment = { Bit8u(target), Bit8u(increment) };
+		if (kind[0] == 'a') {
+			ampSegments.push_back(segment);
+		} else if (kind[0] == 'c') {
+			cutoffSegments.push_back(segment);
+		} else {
+			usage();
+		}
+	}
+	if (block == 0) usage();
+
+	// Pass one: the per-sample controls, with one block of lookahead for the
+	// ramped-amp mode. The ramps behave exactly as Partial::getAmpValue and
+	// getCutoffValue drive them: the value is read, then a raised interrupt
+	// starts the next segment for the following sample.
+	LA32Ramp::initTables(tables);
+	LA32Ramp ampRamp, cutoffRamp;
+	size_t ampIndex = 0, cutoffIndex = 0;
+	if (!ampSegments.empty()) ampRamp.startRamp(ampSegments[0].target, ampSegments[0].increment);
+	if (!cutoffSegments.empty()) cutoffRamp.startRamp(cutoffSegments[0].target, cutoffSegments[0].increment);
+	const unsigned total = frames + block;
+	std::vector<Bit32u> amp(total), cutoff(total);
+	std::vector<Bit16u> pitch(total);
+	for (unsigned i = 0; i < total; i++) {
+		amp[i] = 67117056 - ampRamp.nextValue();
+		if (ampRamp.checkInterrupt() && ++ampIndex < ampSegments.size()) {
+			ampRamp.startRamp(ampSegments[ampIndex].target, ampSegments[ampIndex].increment);
+		}
+		cutoff[i] = (baseCutoff << 18) + cutoffRamp.nextValue();
+		if (cutoffRamp.checkInterrupt() && ++cutoffIndex < cutoffSegments.size()) {
+			cutoffRamp.startRamp(cutoffSegments[cutoffIndex].target, cutoffSegments[cutoffIndex].increment);
+		}
+		int lfo = 0;
+		if (lfoDepth != 0 && lfoPeriod != 0) {
+			const unsigned t = i - i % PITCH_TIMER_SAMPLES;
+			const double x = 4.0 * double(t % lfoPeriod) / double(lfoPeriod);
+			const double triangle = x < 1.0 ? x : (x < 3.0 ? 2.0 - x : x - 4.0);
+			lfo = int(lround(triangle * lfoDepth));
+		}
+		pitch[i] = Bit16u(int(basePitch) + lfo);
+	}
+
+	const bool holdAmp = strchr(mode, 'A') != NULL;
+	const bool holdPitch = strchr(mode, 'P') != NULL;
+	const bool holdCutoff = strchr(mode, 'C') != NULL;
+	const bool rampAmp = strchr(mode, 'R') != NULL;
+	if (strchr(mode, 'D') != NULL) {
+		// The words the host would send per block: amp >> 10, pitch, cutoff >> 3,
+		// the cutoff clamped as generateNextSample clamps it, which also keeps
+		// the word inside the DSP's signed 24 bits when the base and the
+		// modifier add up past 256 levels.
+		const Bit32u maxCutoff = 240 << 18;
+		for (unsigned i = 0; i < frames; i++) {
+			const Bit32u c = cutoff[i] < maxCutoff ? cutoff[i] : maxCutoff;
+			printf("%u %u %u\n", unsigned(amp[i] >> 10), unsigned(pitch[i]), unsigned(c >> 3));
+		}
+		return 0;
+	}
+
+	// Pass two: render with the controls the block-rate design applies.
+	LA32IntPartialPair::initTables(tables);
+	LA32IntPartialPair pair;
+	pair.init(false, false);
+	pair.initSynth(LA32PartialPair::MASTER, sawtooth, Bit8u(pulseWidth), Bit8u(resonance));
+	pair.deactivate(LA32PartialPair::SLAVE);
+	for (unsigned i = 0; i < frames; i++) {
+		const unsigned start = i - i % block;
+		Bit32u a = amp[i];
+		Bit16u p = pitch[i];
+		Bit32u c = cutoff[i];
+		if (block > 1) {
+			if (holdPitch) p = pitch[start];
+			if (holdCutoff) c = (cutoff[start] >> 3) << 3;
+			if (rampAmp) {
+				// One add per frame on the DSP: the slope between this block's
+				// and the next block's amp term, truncated toward zero.
+				const Bit32s from = Bit32s(amp[start] >> 10);
+				const Bit32s to = Bit32s(amp[start + block] >> 10);
+				const Bit32s slope = (to - from) / Bit32s(block);
+				a = Bit32u(from + slope * Bit32s(i - start)) << 10;
+			} else if (holdAmp) {
+				a = (amp[start] >> 10) << 10;
+			}
+		}
+		pair.generateNextSample(LA32PartialPair::MASTER, a, p, c);
+		const Bit16s sample = pair.nextOutSample();
+		const int left = (int(sample) * panLeft) >> 13;
+		const int right = (int(sample) * panRight) >> 13;
+		printf("%d %d %d\n", int(sample), left, right);
+	}
+	return 0;
 }
 
 // One PCM partial, the master of a pair with the slave silent, so the wave
@@ -89,6 +212,22 @@ int main(int argc, char **argv) {
 		const unsigned level = strtoul(argv[3], NULL, 0);
 		if (time > 7 || level > 7) usage();
 		return runReverb(time, level);
+	}
+	if (argc == 14 && strcmp(argv[1], "control") == 0) {
+		const bool sawtooth = atoi(argv[2]) != 0;
+		const unsigned pulseWidth = strtoul(argv[3], NULL, 0);
+		const unsigned resonance = strtoul(argv[4], NULL, 0);
+		const int panLeft = atoi(argv[5]);
+		const int panRight = atoi(argv[6]);
+		const unsigned frames = strtoul(argv[7], NULL, 0);
+		const unsigned block = strtoul(argv[8], NULL, 0);
+		const unsigned basePitch = strtoul(argv[10], NULL, 0);
+		const unsigned baseCutoff = strtoul(argv[11], NULL, 0);
+		const int lfoDepth = atoi(argv[12]);
+		const unsigned lfoPeriod = strtoul(argv[13], NULL, 0);
+		if (pulseWidth > 255 || resonance < 1 || resonance > 31 || basePitch > 59392 || baseCutoff > 255) usage();
+		return runControl(tables, sawtooth, pulseWidth, resonance, panLeft, panRight, frames, block,
+			argv[9], basePitch, baseCutoff, lfoDepth, lfoPeriod);
 	}
 	if (argc == 9 && strcmp(argv[1], "pcm") == 0) {
 		const unsigned length = strtoul(argv[2], NULL, 0);

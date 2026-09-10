@@ -53,6 +53,13 @@ CXX ?= g++
 PCM_TABLES := $(GENERATED_BUILD)/pcmtabs.i
 PCM_PROFILE_DIR := build/pcm-profile
 
+# Control-rate spike: the host's per-block payloads come from the oracle's
+# own per-sample controls (see tools/control_rate.py).
+CONTROL_TABLES := $(GENERATED_BUILD)/ctrltabs.i
+CONTROL_PROFILE_DIR := build/control-profile
+CONTROL_SWEEP := build/control-rate/sweep.txt
+NCODE ?= 2
+
 M68K_SOURCES := \
 	src/m68k/main.s \
 	src/m68k/dsp_link.s \
@@ -105,7 +112,7 @@ DOSBOX_FLAGS ?= --noprimaryconf --set output=texture
 
 .PHONY: all help host dsp reference check smoke run verbose clean tools \
 	oracle profile-partial profile-partials profile-transport \
-	profile-pcm profile-pcms
+	profile-pcm profile-pcms profile-control profile-controls control-sweep
 
 all: host dsp
 
@@ -132,6 +139,15 @@ help:
 	@echo "             runs 0-3 the exact kernel, 4-7 the perceptual one"
 	@echo "  profile-pcms"
 	@echo "             the same for every PCM run"
+	@echo "  control-sweep"
+	@echo "             grade held controls against per-sample ones with the"
+	@echo "             oracle alone, for block lengths of 2 to 128 frames"
+	@echo "  profile-control CFG=n NCODE=m"
+	@echo "             render control run n on the DSP with blocks of 8, 16, 32"
+	@echo "             or 64 frames (m = 0..3), deriving the kernel constants"
+	@echo "             per block, check it against the oracle and report"
+	@echo "  profile-controls"
+	@echo "             the same for every run and block length"
 	@echo "  clean      remove generated build/ and release/ directories"
 	@echo
 	@echo "The DSP step needs DOSBox for Motorola's ASM56000 and a C++17"
@@ -146,7 +162,8 @@ host: $(RELEASE_DIR)/f030mt32.tos $(RELEASE_DIR)/f030mt32.ttp
 dsp: $(RELEASE_DIR)/la32.lod $(RELEASE_DIR)/reverb.lod $(DSP_STAGE2_IMAGE) \
 	$(DSP_REVERB_IMAGE)
 
-reference: $(TONE_TABLE) $(LA32_TABLES) $(LA32_REVERB_TABLES) $(PCM_TABLES)
+reference: $(TONE_TABLE) $(LA32_TABLES) $(LA32_REVERB_TABLES) $(PCM_TABLES) \
+	$(CONTROL_TABLES)
 
 oracle: $(LA32_ORACLE)
 
@@ -188,12 +205,14 @@ $(TONE_TABLE): tools/generate_tone_table.py src/dsp/protocol.inc
 $(LA32_ORACLE): tools/la32_partial_oracle.cpp tools/mt32emu_config/config.h \
 		$(MUNT_SRC)/LA32WaveGenerator.cpp $(MUNT_SRC)/LA32WaveGenerator.h \
 		$(MUNT_SRC)/Tables.cpp $(MUNT_SRC)/Tables.h \
-		$(MUNT_SRC)/BReverbModel.cpp $(MUNT_SRC)/BReverbModel.h
+		$(MUNT_SRC)/BReverbModel.cpp $(MUNT_SRC)/BReverbModel.h \
+		$(MUNT_SRC)/LA32Ramp.cpp $(MUNT_SRC)/LA32Ramp.h
 	@mkdir -p $(NATIVE_BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++17 -O2 \
 		-Itools/mt32emu_config -I$(MUNT_SRC) \
 		tools/la32_partial_oracle.cpp $(MUNT_SRC)/LA32WaveGenerator.cpp \
-		$(MUNT_SRC)/Tables.cpp $(MUNT_SRC)/BReverbModel.cpp -o $@
+		$(MUNT_SRC)/Tables.cpp $(MUNT_SRC)/BReverbModel.cpp \
+		$(MUNT_SRC)/LA32Ramp.cpp -o $@
 
 $(LA32_TABLE_DUMP): $(LA32_ORACLE)
 	@mkdir -p $(GENERATED_BUILD)
@@ -202,6 +221,12 @@ $(LA32_TABLE_DUMP): $(LA32_ORACLE)
 $(PCM_TABLES): tools/pcm_partial.py tools/la32_partial.py $(LA32_TABLE_DUMP)
 	@mkdir -p $(GENERATED_BUILD)
 	python3 tools/pcm_partial.py tables --tables $(LA32_TABLE_DUMP) > $@
+
+$(CONTROL_TABLES): tools/control_rate.py tools/la32_partial.py $(LA32_TABLE_DUMP) \
+		$(LA32_ORACLE)
+	@mkdir -p $(GENERATED_BUILD)
+	python3 tools/control_rate.py tables --tables $(LA32_TABLE_DUMP) \
+		--oracle $(LA32_ORACLE) > $@
 
 $(LA32_TABLES): tools/la32_partial.py $(LA32_TABLE_DUMP)
 	python3 tools/la32_partial.py tables --tables $(LA32_TABLE_DUMP) > $@
@@ -284,7 +309,7 @@ $(DSP_REVERB_IMAGE): tools/generate_dsp_stage2.py $(DSP_BUILD)/.assembled
 
 $(M68K_BUILD)/%.o: src/m68k/%.s src/m68k/xbios.i src/m68k/verbose.i \
 		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(DSP_REVERB_IMAGE) \
-		$(PCM_TABLES) $(VASM)
+		$(PCM_TABLES) $(CONTROL_TABLES) $(VASM)
 	@mkdir -p $(M68K_BUILD)
 	$(VASM) $< -quiet -Felf -m68030 -Isrc/m68k -I$(GENERATED_BUILD) \
 		-o $@ -L $(M68K_BUILD)/$*.lst
@@ -303,7 +328,7 @@ $(RELEASE_DIR)/f030mt32.ttp: $(RELEASE_DIR)/f030mt32.tos
 # a hang leaves a dangling label naming the call that never returned.
 $(VERBOSE_M68K_BUILD)/%.o: src/m68k/%.s src/m68k/xbios.i src/m68k/verbose.i \
 		src/m68k/protocol.i $(DSP_STAGE2_IMAGE) $(DSP_REVERB_IMAGE) \
-		$(PCM_TABLES) $(VASM)
+		$(PCM_TABLES) $(CONTROL_TABLES) $(VASM)
 	@mkdir -p $(VERBOSE_M68K_BUILD)
 	$(VASM) $< -quiet -Felf -m68030 -DVERBOSE_BOOT \
 		-Isrc/m68k -I$(GENERATED_BUILD) -o $@ \
@@ -339,6 +364,7 @@ check: all reference
 	@rg -q "^la32_unlog_image:" $(LA32_TABLES)
 	@rg -q "^la32_reverb_input_image:" $(LA32_REVERB_TABLES)
 	@rg -q "^pcm_cfg_image:" $(PCM_TABLES)
+	@rg -q "^ctrl_payload_table:" $(CONTROL_TABLES)
 	# The two protocol headers are one contract in two syntaxes; only their
 	# first line, which names the other file, may differ. Spelled without
 	# process substitution so the recipe works under a plain /bin/sh.
@@ -501,7 +527,7 @@ PCM_PROFILE_REFERENCE = $(LA32_REFERENCE_DIR)/pcm-partial-$(CFG).txt
 
 profile-pcm: check tools/pcm_partial.py
 	$(call require_hatari,profile-pcm)
-	@test -n "$(CFG)" || { echo "error: profile-pcm needs CFG=0..7" >&2; exit 1; }
+	@test -n "$(CFG)" || { echo "error: profile-pcm needs CFG=0..11" >&2; exit 1; }
 	@rm -rf $(PCM_PROFILE_RUN) $(RELEASE_DIR)/PCMOUT.BIN
 	@mkdir -p $(PCM_PROFILE_RUN) $(LA32_REFERENCE_DIR)
 	@python3 tools/pcm_partial.py wave $(CFG) > $(PCM_PROFILE_RUN)/wave.txt
@@ -510,7 +536,7 @@ profile-pcm: check tools/pcm_partial.py
 	@python3 tools/pcm_partial.py prepare \
 		--listing $(DSP_BUILD)/LA32.LST \
 		--output-dir $(PCM_PROFILE_RUN) $(CFG)
-	@printf 'P$(CFG)' > $(RELEASE_DIR)/PROFILE.CFG
+	@printf '%s' "$$(python3 tools/pcm_partial.py cfg $(CFG))" > $(RELEASE_DIR)/PROFILE.CFG
 	@cd $(RELEASE_DIR) && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(HATARI) \
 		--machine falcon --dsp emu --memsize 4 \
 		--tos $(CURDIR)/$(TOS_ROM) --patch-tos true \
@@ -548,6 +574,72 @@ profile-pcm: check tools/pcm_partial.py
 profile-pcms:
 	@for cfg in $$(seq 0 $$(( $$(python3 tools/pcm_partial.py count) - 1 ))); do \
 		$(MAKE) --no-print-directory profile-pcm CFG=$$cfg || exit 1; \
+	done
+
+# The control rate, oracle only: every scenario rendered with per-sample
+# controls and with controls held per block, graded against each other.
+control-sweep: $(LA32_ORACLE) tools/control_rate.py
+	@mkdir -p $(dir $(CONTROL_SWEEP))
+	@python3 tools/control_rate.py sweep --oracle $(LA32_ORACLE) --output $(CONTROL_SWEEP)
+
+# The control rate on the DSP: run CFG with blocks of the NCODE length, the
+# DSP deriving its constants from each block's record; the output must match
+# the oracle's held render, and the profile includes the derivation.
+CONTROL_PROFILE_RUN = $(CONTROL_PROFILE_DIR)/$(CFG)-n$(NCODE)
+CONTROL_PROFILE_REFERENCE = $(LA32_REFERENCE_DIR)/control-$(CFG)-n$(NCODE).txt
+
+profile-control: check tools/control_rate.py tools/profile_dsp.py
+	$(call require_hatari,profile-control)
+	@test -n "$(CFG)" || { echo "error: profile-control needs CFG=0..7 and NCODE=0..3" >&2; exit 1; }
+	@rm -rf $(CONTROL_PROFILE_RUN)
+	@mkdir -p $(CONTROL_PROFILE_RUN) $(LA32_REFERENCE_DIR)
+	@python3 tools/control_rate.py segments $(CFG) > $(CONTROL_PROFILE_RUN)/segments.txt
+	@$(LA32_ORACLE) $$(python3 tools/control_rate.py oracle-args $(CFG) --ncode $(NCODE)) \
+		< $(CONTROL_PROFILE_RUN)/segments.txt > $(CONTROL_PROFILE_REFERENCE)
+	@python3 tools/profile_dsp.py prepare \
+		--listing $(DSP_BUILD)/LA32.LST \
+		--output-dir $(CONTROL_PROFILE_RUN) \
+		--marker $$(python3 tools/control_rate.py marker $(CFG) --ncode $(NCODE)) \
+		--start-symbol la32_control_loop --end-symbol la32_control_done \
+		--marker-space y --dump x:0x1000-0x1fff
+	@printf '%s' "$$(python3 tools/control_rate.py cfg $(CFG) --ncode $(NCODE))" \
+		> $(RELEASE_DIR)/PROFILE.CFG
+	@cd $(RELEASE_DIR) && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(HATARI) \
+		--machine falcon --dsp emu \
+		--tos $(CURDIR)/$(TOS_ROM) --patch-tos true \
+		--fast-boot true --fast-forward true --sound off \
+		--confirm-quit false --run-vbls 1200 \
+		--trace-file $(CURDIR)/$(CONTROL_PROFILE_RUN)/trace.txt \
+		--trace dsp_host_interface \
+		--parse $(CURDIR)/$(CONTROL_PROFILE_RUN)/start.ini \
+		f030mt32.tos \
+		> $(CURDIR)/$(CONTROL_PROFILE_RUN)/debug.log 2>&1 || { \
+			rm -f $(RELEASE_DIR)/PROFILE.CFG; \
+			tail -n 60 $(CURDIR)/$(CONTROL_PROFILE_RUN)/debug.log >&2; \
+			exit 1; \
+		}
+	@rm -f $(RELEASE_DIR)/PROFILE.CFG
+	@test -s $(CONTROL_PROFILE_RUN)/profile.txt || { \
+		echo "error: Hatari did not capture the control-run profile" >&2; \
+		tail -n 60 $(CONTROL_PROFILE_RUN)/debug.log >&2; \
+		exit 1; \
+	}
+	@python3 tools/control_rate.py compare \
+		--dump $(CONTROL_PROFILE_RUN)/debug.log \
+		--oracle $(CONTROL_PROFILE_REFERENCE) $(CFG)
+	@python3 tools/profile_dsp.py report \
+		--listing $(DSP_BUILD)/LA32.LST \
+		--profile $(CONTROL_PROFILE_RUN)/profile.txt \
+		--output $(CONTROL_PROFILE_RUN)/report.txt \
+		--samples 2048 --sample-rate 32779.947916 \
+		--unit-label "codec frame" \
+		--title "DSP56001 control run $(CFG) ($$(python3 tools/control_rate.py name $(CFG) --ncode $(NCODE)))"
+
+profile-controls:
+	@for cfg in $$(seq 0 $$(( $$(python3 tools/control_rate.py count) - 1 ))); do \
+		for ncode in 0 1 2 3; do \
+			$(MAKE) --no-print-directory profile-control CFG=$$cfg NCODE=$$ncode || exit 1; \
+		done; \
 	done
 
 run: all

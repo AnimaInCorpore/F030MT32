@@ -165,7 +165,7 @@ CONFIGS = [
     # step 0.31: each pair lasts three frames, the ladder at its coarsest
     PCMConfig("pcm-loop-deep", WAVE_LOOP, 13557, 240, 6),
 ]
-KERNELS = ["exact", "perceptual"]
+KERNELS = ["exact", "perceptual", "mono"]
 
 
 @dataclass(frozen=True)
@@ -194,11 +194,16 @@ def gain_pan(tables: Tables, ampt: int, pan: int) -> int:
 
 def config_longs(tables: Tables, run: PCMRun) -> list[int]:
     c = run.config
+    # The mono kernel carries the gain alone where the perceptual one carries
+    # gain times pan: a DSP that pans and mixes the stream takes the pan.
+    if run.kernel == "mono":
+        factors = [tables.unlog(c.ampt), 0]
+    else:
+        factors = [gain_pan(tables, c.ampt, c.pan_left), gain_pan(tables, c.ampt, c.pan_right)]
     return [
         c.wave, c.length, int(c.looped), pcm_step(tables, c.pitch), c.ampt,
         c.pan_left, c.pan_right, KERNELS.index(run.kernel),
-        gain_pan(tables, c.ampt, c.pan_left), gain_pan(tables, c.ampt, c.pan_right),
-    ]
+    ] + factors
 
 
 def dc_lines(directive: str, values: list[int], width: int) -> list[str]:
@@ -311,7 +316,12 @@ def compare(output: Path, oracle: Path, run_index: int) -> int:
         print("  PASS: every left and right word equals the Munt integer model")
         return 0
     ok = True
-    for channel, got, ref in (("left", left, ref_left), ("right", right, ref_right)):
+    if run.kernel == "mono":
+        # The mono kernel's word is the partial's sample before the pan.
+        channels = (("mono", left, [s for s, _l, _r in rows]),)
+    else:
+        channels = (("left", left, ref_left), ("right", right, ref_right))
+    for channel, got, ref in channels:
         lines, channel_ok = grade(got, ref)
         print(f"  {channel}:")
         print("\n".join(lines))
@@ -432,7 +442,7 @@ def main() -> None:
     elif args.command == "kernel":
         print(RUNS[args.run].kernel)
     elif args.command == "cfg":
-        print(f"P{args.run}")
+        print(f"P{args.run:02d}")
     elif args.command == "prepare":
         write_debugger_scripts(args.listing, args.output_dir, args.run)
     elif args.command == "compare":

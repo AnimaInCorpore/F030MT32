@@ -47,6 +47,17 @@ There are two ways to use that, and the choice matters:
   envelope and LFO timing. This is what F030MXDRV's production kernel does, and
   it is the recommended choice here.
 
+How often the controls must reach the DSP is measured
+([`la32-budget.md`](la32-budget.md#the-control-rate)): the amp has to be
+ramped every frame, because the LA32's fastest envelope moves it four
+percent per sample, and the cutoff sets the block length at sixteen frames,
+with 32 serving once no filter attack is running; the pitch is already
+re-evaluated only every eight samples by the MT-32's own MCU. So the host
+sends each partial's amp, pitch and cutoff — three words — per sixteen-frame
+block, aligned to its envelope's segment starts, and the DSP derives the
+kernel's constants from them, which costs 303 cycles per block and partial
+in its first version.
+
 The second option is not free of consequences and they should be written down
 before anyone is surprised by them:
 
@@ -280,9 +291,14 @@ Only this much runs:
   command over a buffer of input frames in a second DSP image — again a
   measurement: it processes a fixed buffer, not the codec stream;
 - one PCM partial on the 68030 from a synthetic wave in the ROM's word
-  format, in an exact and a perceptual kernel, rendered to a file for the
-  oracle comparison and timed between two host-port markers — a
-  measurement of the host's half of the split, not a voice.
+  format, in an exact, a perceptual and a mono kernel, rendered to a file
+  for the oracle comparison and timed between two host-port markers — a
+  measurement of the host's half of the split, not a voice;
+- the control-run command: the DSP takes a run's static constants and one
+  record of amp, pitch and cutoff per block from the host and renders block
+  by block, deriving its kernel constants from each record — the block-rate
+  control path, measured against the oracle's held render, with the
+  envelopes themselves still on the oracle's side.
 
-No MIDI, no ROM handling, no envelopes, and no oracle beyond the wave
-generator, the PCM partial and the reverb.
+No MIDI, no ROM handling, no envelopes on the Falcon, and no oracle beyond
+the wave generator, the PCM partial, the reverb and the control ramps.

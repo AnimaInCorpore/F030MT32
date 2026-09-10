@@ -172,6 +172,8 @@ la_mcos11       ds      1               ; $7ff000: perceptual cosine index bits 
 la_sqlog        ds      1               ; scratch: square log sample
 la_rmul         ds      1               ; scratch: resonance sign multiplier
 la_rlog         ds      1               ; scratch
+la_frames       ds      1               ; frames per kernel call: a run or a block
+la_blocks       ds      1               ; blocks in a control run
 la_step3        ds      1               ; configuration: sampleStep << 3
 la_k7           ds      1               ; (resonanceWaveLengthFactor >> 4) << 7
 la_b3           ds      1               ; start of the negative half, S4 units
@@ -186,6 +188,31 @@ la_half0        ds      4               ; per half, exact: sign base, linear len
 la_half1        ds      4               ;   decay << 15, square sign multiplier;
                                         ; perceptual: linear length, sine table base,
                                         ;   decay << 15, signed square gain
+
+; Control-run state, past the short-absolute range: the per-block derivation
+; is the only reader and can afford long addressing.
+        org     y:$40
+la_epw          ds      1               ; effective pulse width term, static per partial
+la_ras          ds      1               ; resonance amp subtraction, static per partial
+la_record       ds      1               ; next control record
+la_scr_ampt     ds      1               ; the record's amp >> 10
+la_scr_c        ds      1               ; the record's cutoff >> 3, clamped
+la_scr_ecv      ds      1               ; effective cutoff value
+la_scr_rwlf4    ds      1               ; resonance wave length factor << 4
+la_scr_hl4      ds      1               ; high linear length >> 4
+la_scr_ll4      ds      1               ; low linear length >> 4
+la_recbase      ds      1               ; the first control record
+la_blocklen     ds      1               ; frames per block
+; Munt applies a sample's pitch and cutoff to the wave position one sample
+; after its amp - advancePosition runs after the log samples - so a block's
+; position constants wait here through its first frame.
+la_pend_step3   ds      1
+la_pend_k7      ds      1
+la_pend_b3      ds      1
+
+; Control records land here from the host port: LA32_CONTROL_HEADER words
+; then three per block, below the X table alias at P:$4000.
+LA32_CONTROL_RECORDS equ $3c00
 
         ENDIF
 
@@ -396,7 +423,7 @@ la32_reverb_done:
 
 la32_square_run:
         move    y:<la_step3,x0
-        do      #LA32_PROFILE_FRAMES,la32_square_done
+        do      y:<la_frames,la32_square_done
 la32_square_loop:
 ; phase advance: WP3 wraps naturally in 24 bits, bits 11-22 feed the multiply
         move    y:<la_wp3,a
@@ -488,7 +515,7 @@ la32_square_done:
 
 la32_saw_run:
         move    y:<la_step3,x0
-        do      #LA32_PROFILE_FRAMES,la32_saw_done
+        do      y:<la_frames,la32_saw_done
 la32_saw_loop:
         move    y:<la_wp3,a
         add     x0,a    y:<la_wphmask,x0
@@ -600,7 +627,7 @@ la32_saw_done:
 ; the signed square gain.
 la32_psquare_run:
         move    y:<la_step3,x0
-        do      #LA32_PROFILE_FRAMES,la32_psquare_done
+        do      y:<la_frames,la32_psquare_done
 la32_psquare_loop:
 ; phase advance
         move    y:<la_wp3,a
@@ -665,7 +692,7 @@ la32_psquare_done:
 
 la32_psaw_run:
         move    y:<la_step3,x0
-        do      #LA32_PROFILE_FRAMES,la32_psaw_done
+        do      y:<la_frames,la32_psaw_done
 la32_psaw_loop:
         move    y:<la_wp3,a
         add     x0,a    y:<la_wphmask,x0
@@ -805,6 +832,10 @@ command_loop:
         cmp     x0,a
         jeq     command_profile
 
+        move    #>MT32_CMD_CONTROL_RUN,x0
+        cmp     x0,a
+        jeq     command_control
+
 command_unknown:
         move    #>MT32_REPLY_ERROR,a
         jsr     send_reply
@@ -904,6 +935,10 @@ command_profile:
         jsr     send_reply
         jmp     command_loop
 
+; Control runs need the partial image.
+command_control:
+        jmp     command_unknown
+
 ; Silence the seven lines, then set the pointers as Munt's indices start:
 ; the entrance and the combs at slot 0, the allpasses at slot 1, which is
 ; the slot their first frame reads and writes.
@@ -965,15 +1000,26 @@ la32_tables_install:
 
         ELSE
 
-; Partial image: install, clear the output buffer, render with the kernel
-; and wave the configuration names, fold and reply.
+; Partial image: install, clear the output buffer, render the whole run
+; with the kernel and wave the configuration names, fold and reply.
 command_profile:
         move    y:last_command,a
         move    #>$0000ff,x0
         and     x0,a
         jsr     profile_install
-        ; the loop advances before it renders, so start one step early and
-        ; the first frame is Munt's position zero
+        move    #>LA32_PROFILE_FRAMES,x0
+        move    x0,y:<la_frames
+        jsr     profile_prepare
+        jsr     la32_kernel_run
+        jsr     profile_fold
+        jsr     send_reply
+        jmp     command_loop
+
+; Start the wave one step early, so the first frame is Munt's position
+; zero, clear the output buffer, and set what the kernels expect: every m
+; linear, r3 = la_half0, r4/r5/r7 = the FWD, ZERO and REV square tables
+; 512 words apart, r6 = the output buffer.
+profile_prepare:
         clr     a
         move    y:<la_step3,x0
         sub     x0,a
@@ -981,9 +1027,9 @@ command_profile:
         move    #>LA32_OUTPUT_BASE,r6
         move    #>LA32_OUTPUT_WORDS,x0
         clr     a
-        do      x0,command_profile_cleared
+        do      x0,profile_prepare_cleared
         move    a1,x:(r6)+
-command_profile_cleared:
+profile_prepare_cleared:
         move    #>-1,m0
         move    #>-1,m1
         move    #>-1,m2
@@ -992,7 +1038,6 @@ command_profile_cleared:
         move    #>-1,m6
         move    #>-1,m7
         move    #<la_half0,r3
-        ; the kernel's square tables: FWD, then ZERO and REV 512 words apart
         move    y:<la_sqbase,a
         move    #>512,x0
         move    a1,r4
@@ -1001,32 +1046,319 @@ command_profile_cleared:
         add     x0,a
         move    a1,r7
         move    #>LA32_OUTPUT_BASE,r6
+        rts
+
+; Render la_frames frames with the kernel and wave the configuration names.
+; A reverb run's kernel word renders nothing: it needs the other image.
+la32_kernel_run:
         move    y:<la_kernel,a
         tst     a
-        jne     command_profile_perceptual
+        jne     la32_kernel_perceptual
         move    y:<la_saw,a
         tst     a
-        jne     command_profile_saw
-        jsr     la32_square_run
-        jmp     command_profile_fold
-command_profile_saw:
-        jsr     la32_saw_run
-        jmp     command_profile_fold
-command_profile_perceptual:
+        jne     la32_saw_run
+        jmp     la32_square_run
+la32_kernel_perceptual:
         move    #>1,x0
         cmp     x0,a
-        jne     command_unknown         ; a reverb run needs the other image
+        jne     la32_kernel_none
         move    y:<la_saw,a
         tst     a
-        jne     command_profile_psaw
-        jsr     la32_psquare_run
-        jmp     command_profile_fold
-command_profile_psaw:
-        jsr     la32_psaw_run
-command_profile_fold:
+        jne     la32_psaw_run
+        jmp     la32_psquare_run
+la32_kernel_none:
+        rts
+
+; -----------------------------------------------------------------------------
+; Control-rate spike: MT32_CMD_CONTROL_RUN
+; -----------------------------------------------------------------------------
+
+; Take the payload from the host into the record area - the kernel's static
+; constants, the pulse-width and resonance terms, the block length and
+; count, then one record per block - install the constants, and render the
+; run block by block, deriving the kernel's constants from each record
+; first. The block loop is what the profiler brackets; the derivation
+; before it only gives the wave its starting position.
+command_control:
+        move    #>MT32_REPLY_BLOCK_READY,a
+        jsr     send_reply
+        move    #>LA32_CONTROL_RECORDS,r0
+        move    #>-1,m0
+        do      #LA32_CONTROL_HEADER,command_control_header
+        jclr    #0,x:m_hsr,*
+        movep   x:m_hrx,a
+        move    a1,y:(r0)+
+command_control_header:
+        move    #>LA32_CONTROL_RECORDS,r1
+        move    #<la_step3,r2
+        do      #LA32_CONFIG_WORDS,command_control_installed
+        move    y:(r1)+,x0
+        move    x0,y:(r2)+
+command_control_installed:
+        move    y:(r1)+,x0
+        move    x0,y:>la_epw
+        move    y:(r1)+,x0
+        move    x0,y:>la_ras
+        move    y:(r1)+,x0
+        move    x0,y:>la_blocklen
+        move    y:(r1)+,a
+        move    a1,y:<la_blocks
+        move    r1,y:>la_recbase
+        move    a1,b
+        asl     b
+        add     a,b                     ; three words per block
+        move    b1,x0
+        do      x0,command_control_records
+        jclr    #0,x:m_hsr,*
+        movep   x:m_hrx,a
+        move    a1,y:(r0)+
+command_control_records:
+        move    y:>la_recbase,x0
+        move    x0,y:>la_record
+        jsr     la32_block_derive
+        jsr     la32_block_positions
+        jsr     profile_prepare
+        move    y:>la_recbase,x0
+        move    x0,y:>la_record
+        ; Per block: derive, render the first frame with the previous
+        ; block's position constants and this block's amp, install the
+        ; position constants, render the rest.
+        do      y:<la_blocks,la32_control_done
+la32_control_loop:
+        jsr     la32_block_derive
+        move    #>1,x0
+        move    x0,y:<la_frames
+        jsr     la32_kernel_run
+        jsr     la32_block_positions
+        move    y:>la_blocklen,a
+        move    #>1,x0
+        sub     x0,a
+        move    a1,y:<la_frames
+        jsr     la32_kernel_run
+        nop
+la32_control_done:
         jsr     profile_fold
         jsr     send_reply
         jmp     command_loop
+
+; Move a block's pending position constants into the kernel's words.
+la32_block_positions:
+        move    y:>la_pend_step3,x0
+        move    x0,y:<la_step3
+        move    y:>la_pend_k7,x0
+        move    x0,y:<la_k7
+        move    y:>la_pend_b3,x0
+        move    x0,y:<la_b3
+        move    y:<la_kernel,a
+        tst     a
+        jne     la32_positions_perceptual
+        move    y:>la_scr_hl4,x0
+        move    x0,y:<la_half0+1
+        move    y:>la_scr_ll4,x0
+        move    x0,y:<la_half1+1
+        rts
+la32_positions_perceptual:
+        move    y:>la_scr_hl4,x0
+        move    x0,y:<la_half0
+        move    y:>la_scr_ll4,x0
+        move    x0,y:<la_half1
+        rts
+
+; Derive the kernel's block constants from one control record of amp >> 10,
+; pitch and cutoff >> 3, as LA32WaveGenerator does per sample: the sample
+; step, the effective cutoff and its resonance wave-length factor, the
+; segment lengths, the square's amp term and the resonance's base, in the
+; S4 units the kernels use, plus the perceptual square gain. interpolateExp
+; comes from the exact unlog table, which holds it << 8 at X:0; shifts by
+; data-dependent counts run in the accumulator under rep, by one more than
+; needed and corrected where the count could be zero. Scratches r0, r2 and
+; every data register; the kernels' r3-r7 survive.
+la32_block_derive:
+        move    y:>la_record,r2
+        nop
+        move    y:(r2)+,a               ; amp >> 10
+        move    a1,y:>la_scr_ampt
+        move    y:(r2)+,y1              ; pitch
+        move    y:(r2)+,b               ; cutoff >> 3
+        move    r2,y:>la_record
+; step = (interpolateExp(~pitch & 4095) << (pitch >> 12)) >> 8, made even; << 3
+        move    y1,a
+        move    #>4095,x1
+        not     a
+        and     x1,a
+        move    a1,r0
+        move    y:<la_sh12,y0           ; pitch >> 12 by a multiply
+        mpy     y1,y0,a
+        move    a1,x1
+        move    #>16,a
+        sub     x1,a                    ; a1 = 16 - (pitch >> 12), at least 2
+        move    a1,x1
+        move    x:(r0),a                ; interpolateExp << 8
+        rep     x1
+        asr     a
+        move    #>$fffffe,x1
+        and     x1,a
+        move    a1,x1
+        move    x1,a                    ; drop the fraction below a1
+        rep     #3
+        asl     a
+        move    a1,y:>la_pend_step3
+; cutoff: clamp at 240, the effective cutoff above the middle
+        move    #>$780000,x1            ; 240 << 15
+        cmp     x1,b
+        tgt     x1,b
+        move    b1,y:>la_scr_c
+        move    #>$400000,x1            ; 128 << 15
+        tfr     b,a
+        sub     x1,a                    ; cutoff - middle
+        move    #>0,x0
+        tmi     x0,a
+        move    a1,x1
+        move    #>$10000,y0             ; 2^16: a right shift by 7
+        mpy     x1,y0,a
+        move    a1,y:>la_scr_ecv
+; resonance wave-length factor << 4, and (rwlf >> 4) << 7 for the kernel
+        move    #>4095,x1
+        tfr     a,b
+        not     b
+        and     x1,b
+        move    b1,r0
+        move    a1,x1
+        move    y:<la_sh12,y0
+        mpy     x1,y0,a                 ; ecv >> 12
+        move    #>1,y1
+        add     y1,a
+        move    a1,x1                   ; shift count + 1
+        move    x:(r0),a
+        rep     x1
+        asl     a
+        rep     #5
+        asr     a
+        move    a1,y:>la_scr_rwlf4
+        rep     #8
+        asr     a
+        move    a1,x1
+        move    x1,a
+        rep     #7
+        asl     a
+        move    a1,y:>la_pend_k7
+; high linear length >> 4: (interpolateExp(~arg & 4095) << (arg >> 12)) >> 5 - 2^15
+; while the pulse-width term is below the effective cutoff, else 0
+        move    y:>la_scr_ecv,a
+        move    y:>la_epw,x1
+        cmp     x1,a
+        jle     la32_derive_no_high
+        sub     x1,a
+        move    a1,y1
+        move    #>4095,x1
+        tfr     a,b
+        not     b
+        and     x1,b
+        move    b1,r0
+        move    y:<la_sh12,y0
+        move    y1,x1
+        mpy     x1,y0,a                 ; arg >> 12
+        move    #>1,y1
+        add     y1,a
+        move    a1,x1
+        move    x:(r0),a
+        rep     x1
+        asl     a
+        rep     #6
+        asr     a
+        move    #>$8000,x1
+        sub     x1,a
+        move    a1,y:>la_scr_hl4
+        jmp     la32_derive_high_done
+la32_derive_no_high:
+        move    #>0,x1
+        move    x1,y:>la_scr_hl4
+la32_derive_high_done:
+; the negative half's start and the low linear length, S4 units
+        move    y:>la_scr_hl4,a
+        move    #>$8000,x1
+        add     x1,a
+        move    a1,y:>la_pend_b3
+        move    y:>la_scr_rwlf4,a
+        move    #>$10000,x1
+        sub     x1,a
+        move    y:>la_scr_hl4,x1
+        sub     x1,a
+        move    a1,y:>la_scr_ll4
+; the square's amp term and the resonance base
+        move    y:>la_scr_ampt,a
+        move    #>$400000,b
+        move    y:>la_scr_c,x1
+        sub     x1,b                    ; middle - cutoff
+        jle     la32_derive_cutoff_high
+        move    b1,x1
+        move    #>$20000,y0             ; 2^17: a right shift by 6
+        mpy     x1,y0,b                 ; the low-cutoff term
+        move    b1,x1
+        add     x1,a
+        move    a1,y:<la_ampt
+        move    x1,b
+        move    #>31743,y1
+        add     y1,b                    ; the resonance's cutoff term
+        jmp     la32_derive_rbase
+la32_derive_cutoff_high:
+        move    a1,y:<la_ampt
+        move    y:>la_scr_c,x1
+        move    #>$480000,b             ; 144 << 15: the decay threshold
+        cmp     x1,b
+        jle     la32_derive_cutoff_zero
+        move    x1,b
+        move    #>$400000,x1
+        sub     x1,b                    ; cutoff - middle
+        move    b1,x1
+        move    #>$2000,y0              ; 2^13: a right shift by 10
+        mpy     x1,y0,b
+        move    b1,x1
+        move    y:<la_rtab,b
+        add     x1,b
+        move    b1,r0
+        nop
+        move    y:(r0),b                ; logsin9 << 2
+        jmp     la32_derive_rbase
+la32_derive_cutoff_zero:
+        move    #>0,b
+la32_derive_rbase:
+        move    y:>la_scr_ampt,a
+        move    y:>la_ras,x1
+        add     x1,a
+        move    b1,x1
+        add     x1,a
+        move    #>4096,x1
+        sub     x1,a
+        move    a1,y:<la_rbase
+; the perceptual kernel's signed square gain applies with the amp
+        move    y:<la_kernel,a
+        tst     a
+        jne     la32_derive_perceptual
+        rts
+la32_derive_perceptual:
+; gain = (interpolateExp(ampt & 4095) << 8) >> (ampt >> 12), from the amp term
+        move    y:<la_ampt,a
+        move    #>4095,x1
+        tfr     a,b
+        and     x1,b
+        move    b1,r0
+        move    a1,x1
+        move    y:<la_sh12,y0
+        mpy     x1,y0,a                 ; ampt >> 12
+        move    #>1,y1
+        add     y1,a
+        move    a1,x1
+        move    x:(r0),a
+        rep     x1
+        asr     a
+        asl     a
+        move    a1,x1
+        move    x1,a
+        neg     a
+        move    x1,y:<la_half0+3
+        move    a1,y:<la_half1+3
+        rts
 
 ; Copy the fixed constants into internal Y and the first page of the unlog
 ; table into internal X from their P images. Both are the only LA32 data the

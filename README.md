@@ -34,10 +34,14 @@ feasibility spike that decides how much of one fits:
   oracle and the Hatari profiling harness that measure all of them
   (`make profile-partials`), and a transport profile that sorts whole
   host-fed periods by what the DSP was doing (`make profile-transport`);
-- one PCM partial on the 68030, again in an exact and a perceptual kernel,
-  checked against Munt from the file the program writes and timed by
-  Hatari's CPU profiler and by the program's own tick count
-  (`make profile-pcms`).
+- one PCM partial on the 68030, in an exact, a perceptual and a mono
+  kernel, checked against Munt from the file the program writes and timed
+  by Hatari's CPU profiler and by the program's own tick count
+  (`make profile-pcms`);
+- the control rate: envelopes and vibrato rendered per sample and held per
+  block by the oracle (`make control-sweep`), and rendered block by block
+  on the DSP, which derives its constants from each block's amp, pitch and
+  cutoff (`make profile-controls`).
 
 Of the three questions that decide whether the project is possible, the first
 two are answered and the answers are hard:
@@ -45,13 +49,13 @@ two are answered and the answers are hard:
 1. **One LA32 partial costs 77 DSP cycles per codec frame as a square wave
    and 100 as a sawtooth when it reproduces Munt bit for bit, and 53 and 64
    when it leaves the log domain through single-table lookups within a few
-   output words of Munt; the reverb costs 92 and the transport 12**,
-   against a budget of 489.40 per frame. After the transport, the reverb
-   and the block-rate control take their share, that is six perceptual
-   partials on the DSP, give or take one by wave — a few timbres at a time,
-   not a nine-part module — and nothing that keeps the LA32's wave shape
-   can reach the 15 cycles that thirty-two partials would need. See
-   [`docs/la32-budget.md`](docs/la32-budget.md).
+   output words of Munt; the reverb costs 92, the transport 12, and the
+   controls, which must move every 16 frames, 19 per partial**, against a
+   budget of 489.40 per frame. After the transport, the reverb and the
+   control take their share, that is five or six perceptual partials on
+   the DSP — a few timbres at a time, not a nine-part module — and nothing
+   that keeps the LA32's wave shape can reach the 15 cycles that thirty-two
+   partials would need. See [`docs/la32-budget.md`](docs/la32-budget.md).
 2. **The PCM ROM does not fit and never will, and the 68030 carries three
    PCM partials.** The ROM is 262,144 samples against 32,768 words of
    Falcon DSP SRAM, so the 68030 renders PCM partials and streams the
@@ -131,8 +135,11 @@ make check
 | `make profile-partial CFG=n` | render run `n` on the DSP and report its cycle cost: runs 0-3 are the exact LA32 partial, checked word for word against the oracle, runs 4-7 the perceptual kernel on the same configurations, checked against error bounds, runs 8-9 the Boss reverb over run 1, word for word | Hatari |
 | `make profile-partials` | the same for every run | Hatari |
 | `make profile-transport` | profile 24 whole host-fed periods of the self-test and sort every DSP cycle into the SSI interrupt, the receive, the once-per-period work and the waits | Hatari |
-| `make profile-pcm CFG=n` | render one PCM partial on the 68030, check it against the oracle and report its cost per period: runs 0-3 the exact kernel, 4-7 the perceptual one | Hatari |
+| `make profile-pcm CFG=n` | render one PCM partial on the 68030, check it against the oracle and report its cost per period: runs 0-3 the exact kernel, 4-7 the perceptual one, 8-11 the mono one | Hatari |
 | `make profile-pcms` | the same for every PCM run | Hatari |
+| `make control-sweep` | grade held controls against Munt's per-sample controls with the oracle alone, for block lengths of 2 to 128 frames | C++17 |
+| `make profile-control CFG=n NCODE=m` | render control run `n` on the DSP with blocks of 8, 16, 32 or 64 frames (`m` = 0..3), deriving the kernel constants per block, check it against the oracle's held render and report | Hatari |
+| `make profile-controls` | the same for every run and block length | Hatari |
 | `make verbose` | build the traced bring-up executable | DOSBox |
 | `make run` | launch the self-test executable in Hatari | Hatari |
 
@@ -166,9 +173,11 @@ Only the first letter of the tail is examined, so `T` and `tone` also work and
 anything else falls back to the self-test. A `PROFILE.CFG` beside the program
 selects a profile spike instead, which is how the profile targets drive it,
 because Hatari's autostart carries no command tail: one digit runs that
-LA32 configuration on the DSP, `P` and a digit renders that PCM run on the
-68030, writes its frames to `PCMOUT.BIN` and prints how many 200 Hz ticks
-the timed render took — on a real Falcon as well as under Hatari.
+LA32 configuration on the DSP, `P` and two digits render that PCM run on
+the 68030, write its frames to `PCMOUT.BIN` and print how many 200 Hz
+ticks the timed render took — on a real Falcon as well as under Hatari —
+and `C`, a run digit and a block-length digit render that control run on
+the DSP.
 
 Counters that stay at zero mean the SSI never clocked — the failure mode
 F030MXDRV chased onto real hardware and eventually traced to Port C pins left
@@ -211,8 +220,11 @@ The intended contracts, in the order they have to be established:
    receive, 12 with a receive by interrupt, and 59 more stalled on the
    68030 as long as the receive polls. `make profile-pcms` measures the
    host's half: 4.67 ms per period for an exact PCM partial, 3.89 for a
-   perceptual one, both checked against Munt from the file the program
-   writes.
+   perceptual one, 2.94 for one left unpanned for the DSP, all checked
+   against Munt from the file the program writes. `make control-sweep`
+   finds the control rate against Munt's per-sample envelopes, and
+   `make profile-controls` measures the DSP deriving its constants per
+   block: 303 cycles per block and partial, bit-exact.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the
    production renderer — the same two-tier split F030MXDRV uses against
@@ -234,9 +246,11 @@ The intended contracts, in the order they have to be established:
 - `tools/la32_partial_oracle.cpp`, `tools/la32_partial.py`: the Munt LA32
   oracle, the DSP table and configuration generator, and the word-for-word
   comparison; `tools/pcm_partial.py` does the same for the 68030 PCM runs
-  and reads their CPU profile; `tools/profile_dsp.py` drives Hatari's DSP
-  profiler and `tools/profile_transport.py` sorts a whole-period profile
-  of the transport into work, stall and idle.
+  and reads their CPU profile; `tools/control_rate.py` defines the control
+  scenarios, grades held against per-sample controls and builds the DSP
+  runs' payloads; `tools/profile_dsp.py` drives Hatari's DSP profiler and
+  `tools/profile_transport.py` sorts a whole-period profile of the
+  transport into work, stall and idle.
 - `tools/`: also the DSP build driver, stage-two image generator and
   tone-table generator.
 - `docs/`: architecture, MT-32 and MIDI ground truth, DSP and emulator notes.

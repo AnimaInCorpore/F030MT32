@@ -143,19 +143,25 @@ pcm_render_shot:
         lea     pcm_wave_shot_image,a0
         lea     pcm_wave_shot_linear,a1
 pcm_render_wave_known:
-        tst.l   PCM_CFG_KERNEL(a6)
-        bne.s   pcm_render_perceptual
+        move.l  PCM_CFG_KERNEL(a6),d4
+        bne.s   pcm_render_linear
         lea     pcm_unlog_signed,a1
         move.w  PCM_CFG_AMPT+2(a6),d2
         bsr.s   pcm_exact
         bra.s   pcm_render_done
-pcm_render_perceptual:
+pcm_render_linear:
         movea.l a1,a0
-        move.l  PCM_CFG_GAINL(a6),d4
-        move.w  d4,(a4)
-        move.l  PCM_CFG_GAINR(a6),d4
-        move.w  d4,2(a4)
+        move.l  PCM_CFG_GAINL(a6),d0
+        move.w  d0,(a4)
+        move.l  PCM_CFG_GAINR(a6),d0
+        move.w  d0,2(a4)
+        move.l  pcm_position,d0
+        subq.l  #1,d4
+        bne.s   pcm_render_mono
         bsr     pcm_perceptual
+        bra.s   pcm_render_done
+pcm_render_mono:
+        bsr     pcm_mono
 pcm_render_done:
         move.l  d0,pcm_position
         movem.l (sp)+,d1-d7/a2-a6
@@ -274,6 +280,50 @@ pcm_perceptual_store:
         move.l  d7,(a2)+
         cmpa.l  a5,a2
         bne     pcm_perceptual
+        rts
+
+; -----------------------------------------------------------------------------
+; Mono kernel
+; -----------------------------------------------------------------------------
+
+; The perceptual kernel without the pan: one gain multiply and one word per
+; frame, the partial as it would leave for a DSP that pans and mixes it.
+; The word lands in the frame's left slot; the right slot is left alone.
+pcm_mono:
+        move.l  d0,d4
+        lsr.l   #8,d4
+        move.w  (a0,d4.l*2),d6
+        addq.l  #1,d4
+        cmp.l   a3,d4
+        blo.s   pcm_mono_second
+        moveq   #0,d4
+        tst.w   4(a4)
+        bne.s   pcm_mono_second
+        moveq   #0,d7
+        bra.s   pcm_mono_mix
+pcm_mono_second:
+        move.w  (a0,d4.l*2),d7
+pcm_mono_mix:
+        sub.w   d6,d7
+        moveq   #0,d4
+        move.b  d0,d4
+        lsr.b   #1,d4
+        muls.w  d4,d7
+        asr.l   #7,d7
+        add.w   d6,d7
+        add.l   d1,d0
+        cmp.l   d3,d0
+        blo.s   pcm_mono_store
+        tst.w   4(a4)
+        beq     pcm_fill_silence
+        sub.l   d3,d0
+pcm_mono_store:
+        muls.w  (a4),d7                 ; * gain
+        asr.l   d5,d7
+        move.l  d7,(a2)
+        addq.l  #8,a2
+        cmpa.l  a5,a2
+        bne     pcm_mono
         rts
 
 ; -----------------------------------------------------------------------------

@@ -33,6 +33,7 @@ MODE_TONE       equ     1
 MODE_STREAM     equ     2
 MODE_PROFILE    equ     3
 MODE_PCM        equ     4
+MODE_CONTROL    equ     5
 
 PCM_CFG_BYTES   equ     40              ; tools/pcm_partial.py config_longs
 PCM_OUTPUT_BYTES equ    20+8*PCM_PROFILE_FRAMES
@@ -125,6 +126,8 @@ start_image_known:
         beq     dispatch_profile
         cmpi.l  #MODE_PCM,d0
         beq     dispatch_pcm
+        cmpi.l  #MODE_CONTROL,d0
+        beq     dispatch_control
 
         bsr     sound_open
         tst.l   d0
@@ -177,6 +180,50 @@ dispatch_pcm:
         bne     pcm_failed
         Cconws  done_text
         Pterm0
+
+dispatch_control:
+        bsr     run_control
+        tst.l   d0
+        bne     control_failed
+        Cconws  done_text
+        Pterm0
+
+; -----------------------------------------------------------------------------
+; Control-rate spike
+; -----------------------------------------------------------------------------
+
+; Arm the profiler with a marker naming the run and the block length, then
+; hand the DSP the run's payload - static constants, block length and count,
+; one control record per block - and print the checksum it replies with once
+; the blocks are rendered. tools/control_rate.py generated the payloads and
+; checks the DSP's buffer against the oracle's held render.
+; out: d0.l = 0 on success
+run_control:
+        move.l  profile_cfg,d0
+        lsl.l   #4,d0
+        or.l    control_ncode,d0
+        or.l    #MT32_CONTROL_MARKER,d0
+        bsr     dsp_exchange
+        cmp.l   #MT32_REPLY_HELLO,d0
+        bne.s   run_control_failed
+        move.l  profile_cfg,d0
+        lsl.l   #2,d0
+        add.l   control_ncode,d0
+        lsl.l   #3,d0                   ; eight bytes per table entry
+        lea     ctrl_payload_table,a0
+        movea.l (a0,d0.l),a3
+        move.l  4(a0,d0.l),d3
+        move.l  #MT32_CMD_CONTROL_RUN,d0
+        bsr     dsp_send_block
+        cmp.l   #MT32_REPLY_BLOCK_READY,d0
+        beq.s   run_control_failed      ; the DSP never took the payload
+        lea     txt_control_checksum,a0
+        bsr     report_value
+        moveq   #0,d0
+        rts
+run_control_failed:
+        moveq   #-1,d0
+        rts
 
 ; -----------------------------------------------------------------------------
 ; LA32 profile spike
@@ -284,40 +331,72 @@ read_hz200:
 
 ; Hatari's autostart cannot pass a command tail, so a PROFILE.CFG beside the
 ; program selects a spike the way F030MXDRV's AUTOPLAY.INF selects a song:
-; one digit for the DSP runs, P and a digit for the 68030 PCM runs. Absent,
-; unreadable or out of range means the self-test.
-; out: d0.l = MODE_PROFILE or MODE_PCM with profile_cfg set, or MODE_SELFTEST
+; one digit for the DSP runs, P and two digits for the 68030 PCM runs, C
+; and two digits - run and block-length code - for the control-rate runs.
+; Absent, unreadable or out of range means the self-test.
+; out: d0.l = MODE_PROFILE, MODE_PCM or MODE_CONTROL with profile_cfg set,
+;      or MODE_SELFTEST
 read_profile_cfg:
         Fopen   profile_cfg_name,#0
         tst.l   d0
-        bmi.s   read_profile_cfg_none
+        bmi     read_profile_cfg_none
         move.w  d0,d7                   ; handle; GEMDOS preserves d3-d7
-        Fread   d7,#2,profile_cfg_bytes
+        Fread   d7,#3,profile_cfg_bytes
         move.l  d0,d6
         Fclose  d7
         tst.l   d6
-        ble.s   read_profile_cfg_none
+        ble     read_profile_cfg_none
         moveq   #0,d0
         move.b  profile_cfg_bytes,d0
         andi.b  #$df,d0
         cmpi.b  #'P',d0
-        bne.s   read_profile_cfg_dsp
-        cmpi.l  #2,d6
-        bne.s   read_profile_cfg_none
+        beq.s   read_profile_cfg_pcm
+        cmpi.b  #'C',d0
+        beq.s   read_profile_cfg_control
+        bra     read_profile_cfg_dsp
+read_profile_cfg_pcm:
+        cmpi.l  #3,d6
+        bne     read_profile_cfg_none
         moveq   #0,d0
         move.b  profile_cfg_bytes+1,d0
         subi.b  #'0',d0
-        cmpi.b  #PCM_PROFILE_CONFIGS-1,d0
-        bhi.s   read_profile_cfg_none
+        cmpi.b  #9,d0
+        bhi     read_profile_cfg_none
+        mulu.w  #10,d0
+        moveq   #0,d1
+        move.b  profile_cfg_bytes+2,d1
+        subi.b  #'0',d1
+        cmpi.b  #9,d1
+        bhi     read_profile_cfg_none
+        add.l   d1,d0
+        cmpi.l  #PCM_PROFILE_CONFIGS-1,d0
+        bhi     read_profile_cfg_none
         move.l  d0,profile_cfg
         moveq   #MODE_PCM,d0
+        rts
+read_profile_cfg_control:
+        cmpi.l  #3,d6
+        bne     read_profile_cfg_none
+        moveq   #0,d0
+        move.b  profile_cfg_bytes+2,d0
+        subi.b  #'0',d0
+        cmpi.b  #LA32_CONTROL_LENGTHS-1,d0
+        bhi     read_profile_cfg_none
+        move.l  d0,control_ncode
+        moveq   #0,d0
+        move.b  profile_cfg_bytes+1,d0
+        subi.b  #'0',d0
+        cmpi.b  #LA32_CONTROL_CONFIGS-1,d0
+        bhi     read_profile_cfg_none
+        move.l  d0,profile_cfg
+        moveq   #MODE_CONTROL,d0
         rts
 read_profile_cfg_dsp:
         moveq   #0,d0
         move.b  profile_cfg_bytes,d0
         subi.b  #'0',d0
         cmpi.b  #LA32_PROFILE_CONFIGS-1,d0
-        bhi.s   read_profile_cfg_none
+        bhi     read_profile_cfg_none
         move.l  d0,profile_cfg
         moveq   #MODE_PROFILE,d0
         rts
@@ -650,6 +729,9 @@ profile_failed:
         bra.s   fail_exit
 pcm_failed:
         Cconws  pcm_error_text
+        bra.s   fail_exit
+control_failed:
+        Cconws  control_error_text
 fail_exit:
         bsr     sound_close
         move.w  #1,-(sp)
@@ -732,6 +814,8 @@ txt_profile_checksum:
         dc.b    'partial checksum   ',0
 txt_pcm_ticks:
         dc.b    'pcm 200 Hz ticks   ',0
+txt_control_checksum:
+        dc.b    'control checksum   ',0
 profile_cfg_name:
         dc.b    'PROFILE.CFG',0
 pcm_output_name:
@@ -750,7 +834,13 @@ profile_error_text:
         dc.b    'LA32 profile spike failed',13,10,0
 pcm_error_text:
         dc.b    'PCM partial spike failed',13,10,0
+control_error_text:
+        dc.b    'control-rate spike failed',13,10,0
         even
+
+; The control-run payloads: static constants and per-block records for
+; every run and block length, generated by tools/control_rate.py.
+        include "ctrltabs.i"
 
 ; The generated DSP image closes the data section, as in F030MXDRV. A TOS
 ; executable starts at the first byte of its text segment, so the image must
@@ -777,8 +867,10 @@ dsp_image_words:
         ds.l    1
 pcm_run_config:
         ds.l    1
+control_ncode:
+        ds.l    1
 profile_cfg_bytes:
-        ds.b    2
+        ds.b    3
         even
 old_left_atten:
         ds.w    1

@@ -13,9 +13,13 @@ listed at the bottom have started, and their numbers are the headline:
 > transport costs 12 when the DSP takes the host's words by interrupt, and
 > the SSI interrupt is 6 of them. One PCM partial on the 68030 costs 4.67 ms
 > of every 15.62 ms period bit for bit and 3.89 ms perceptually, so the
-> host carries three PCM partials beside the DSP's six.** All measured under
-> the DSP-calibrated Hatari on 2026-09-09 (`make profile-partials`,
-> `make profile-transport`, `make profile-pcms`).
+> host carries three PCM partials beside the DSP's six. The controls must
+> move every 16 frames, with the amp ramped inside the block, and deriving
+> a partial's constants from them costs the DSP 300 cycles per block, 19
+> per frame at that rate.** All measured under the DSP-calibrated Hatari on
+> 2026-09-09 and 2026-09-10 (`make profile-partials`, `make
+> profile-transport`, `make profile-pcms`, `make control-sweep`, `make
+> profile-controls`).
 
 Everything below the measurement section is arithmetic that follows from it.
 F030MXDRV remains the cautionary precedent: its first feasibility guess was an
@@ -56,7 +60,10 @@ transport itself: whole periods of the self-test's host-fed stream, with
 every cycle sorted by what the DSP was doing (`make profile-transport`).
 The fifth leaves the DSP: the 68030 renders one PCM partial, the kind of
 partial the DSP can never hold, and Hatari's CPU profiler brackets it
-(`make profile-pcms`).
+(`make profile-pcms`). The sixth lets the controls move: the oracle renders
+envelopes and vibrato per sample and held per block (`make control-sweep`),
+and the DSP renders the same runs block by block, deriving its constants
+from each block's amp, pitch and cutoff (`make profile-controls`).
 
 The output is checked, not auditioned. `tools/la32_partial_oracle.cpp` drives
 Munt's own `LA32IntPartialPair` and `BReverbModel` with the same parameters,
@@ -359,6 +366,108 @@ that also parses MIDI, runs every partial's envelopes and allocation, and
 updates the DSP's controls each block spends part of its period on that
 before any PCM partial is rendered.
 
+A third kernel measures what the host would keep if the DSP panned and
+mixed its PCM partials: the perceptual kernel without the pan, one gain
+multiply and one word per frame, the stream a DSP would take by interrupt.
+It costs 92 cycles per frame, 2.94 ms per period, within two words of
+Munt's sample. What that buys is worked out under the levers.
+
+### The control rate
+
+Every measurement above holds amp, pitch and cutoff for the whole run.
+Munt hands its wave generator a fresh value of each every sample: amp and
+cutoff come from `LA32Ramp`, the chip's own linear ramp toward a target
+that moves up to one level of 256 per sample at the fastest envelope
+setting, and the pitch is re-evaluated by the MT-32's MCU timer every
+eight samples or so. A block-rate kernel holds them across a block and
+derives its table constants once per block, so two things had to be
+measured: how long the block may be, and what the derivation costs.
+
+The first is measured with the oracle alone (`make control-sweep`,
+`tools/control_rate.py`). Four scenarios drive Munt's own ramps with the
+MT-32's envelope vocabulary at its extremes — a pluck with the fastest TVA
+and TVF attack the ROM can ask for, a string swell with vibrato, a brass
+filter sweep with a wide fast LFO, a fast release — rendered per sample
+and then with the controls held per block of 2 to 128 frames, in several
+modes, each graded against the per-sample render with the perceptual
+gate. The block length each mode survives:
+
+| Scenario | Hold all three | Hold pitch and cutoff, ramp the amp | Hold the cutoff only | Hold the pitch only |
+| --- | ---: | ---: | ---: | ---: |
+| pluck | fails at 2 | 2 | 16 | any |
+| string | 4 | 32 | 32 | 64 |
+| brass | 2 | 2 | 2 | 8 |
+| release | 2 | 8 | any | any |
+
+Three findings, one per control. **The amp cannot be held at all**: the
+fastest attack changes the amplitude by four percent per sample, and one
+frame of lag is already outside the bounds. Ramped linearly across the
+block it is exact wherever the ramp is straight, which is the whole ramp
+except the frame where it reaches its target and the frame where the next
+segment starts; those corners are what fails the pluck at four frames. A
+DSP kernel ramps the amp for one add per frame in the exact kernel and one
+add plus a gain lookup in the perceptual one, and with the target carried
+along and block boundaries aligned to the envelope's segment starts —
+which the host knows, since it runs the envelopes — the amp is exact at any
+block length. **The cutoff is the control that sets the block length**: a
+TVF attack at the fastest setting moves 32 levels in 32 frames, which held
+per block is a staircase of a quarter of the range, and re-deriving the
+constants per frame costs what the whole partial costs. Sixteen frames
+keep even that attack inside the bounds; 32 keep the slower sweeps of the
+string and the release. **The pitch is already block-rate**: Munt updates
+it every eight samples, so eight is exact, and what fails the brass at
+sixteen and beyond is a phase lag of a fraction of a sample on a sawtooth,
+which the bounds count word for word — its correlation stays above 0.999
+and its spectral cosine at 1.000 through 32 frames, and the string passes
+64 outright.
+
+So the control rate is **sixteen frames**, 0.49 ms, with the amp ramped
+per frame inside the block; 32 frames serve when no filter envelope is in
+its attack. That is twice the rate the MT-32's own MCU uses for pitch and
+about the rate its envelopes need.
+
+The second is measured on the DSP (`make profile-control CFG=n NCODE=m`).
+The host hands the DSP a run's static constants and one record of amp >> 10,
+pitch and cutoff >> 3 per block — the three words a host running the
+envelopes would send — and the DSP derives the kernel's constants from each
+record before rendering the block: `la32_block_derive` reproduces
+`getSampleStep`, the effective cutoff, the resonance wave-length factor,
+the segment lengths and the two log bases from the same exponent table the
+unlog reads, with the data-dependent shifts run in the accumulator under
+`rep`. Every one of the 32 runs — four scenarios, both kernels, blocks of
+8, 16, 32 and 64 — matches the oracle's held render, the exact kernel word
+for word; one detail of Munt's order had to be copied for that, namely
+that a sample's pitch and cutoff reach the wave position one sample after
+its amp, so a block's position constants are installed after its first
+frame. Per block:
+
+| Per block, one partial | Cycles |
+| --- | ---: |
+| Derivation from the three words | 227 |
+| Installing the position constants | 22 |
+| Kernel dispatch, entry and exit | 34 |
+| Block loop | 20 |
+| **Total** | **303** |
+
+| Block length | Cycles per frame, one partial | Six partials |
+| --- | ---: | ---: |
+| 8 | 38 | 228 |
+| 16 | 19 | 114 |
+| 32 | 9.5 | 57 |
+| 64 | 4.7 | 28 |
+
+At the sixteen-frame rate the controls cost as much as two perceptual
+partials, and "about 20" was the wrong guess by a factor of five. The
+measurement is a worst case, every block re-deriving everything, and the
+derivation is a first version: nine tenths of it belongs to the cutoff,
+which a settled envelope leaves unchanged block after block, so a
+derivation that skips what did not change would leave the sustain of a
+note at about a quarter of this cost; the `rep` shifts, about 50 cycles,
+have power-of-two multiply equivalents; and a host that only sends a
+record when a control has moved makes the block length adaptive per
+partial, sixteen frames in an attack and 64 in a sustain. None of that is
+measured.
+
 ## The arithmetic that follows
 
 489.40 cycles per frame, divided by the per-partial cost, with nothing else
@@ -368,23 +477,25 @@ running; and nothing else running is not an option:
 | --- | ---: | --- |
 | Codec transport, receive by interrupt | 12 | measured, this page |
 | Boss reverb, room mode | 92 | measured, this page |
-| Per-block control, amortized | about 20 | envelope, ramp and pitch updates every 32 frames |
-| **Left for partials** | **about 365** | |
+| Per-block control, six partials at 16-frame blocks | 114 | measured, this page; 57 at 32 frames |
+| **Left for partials** | **about 271** | 328 at 32-frame blocks |
 
 | Kernel | Square | Sawtooth |
 | --- | ---: | ---: |
 | exact, of 489 | 6.3 | 4.9 |
-| exact, of 365 | 4.7 | 3.7 |
+| exact, of 271 | 3.5 | 2.7 |
 | perceptual, of 489 | 9.2 | 7.6 |
-| perceptual, of 365 | 6.9 | 5.7 |
+| perceptual, of 271 | 5.1 | 4.2 |
+| perceptual, of 328 | 6.2 | 5.1 |
 
-That is **six perceptual partials, give or take one by wave, and three or
-four exact ones**, and the MT-32's factory timbres lean on sawtooth partials
-for most sustained sounds. The threshold this page named before any
-measurement, "more than about 60 cycles per partial makes it a
-four-partial machine", is met by the exact kernel and only just escaped by
-the perceptual one; the reverb turned out half again as expensive as
-assumed and the transport as cheap as assumed.
+That is **five perceptual partials at the control rate the fastest
+envelopes need, six when only slow controls move, and three exact ones**,
+and the MT-32's factory timbres lean on sawtooth partials for most
+sustained sounds. The threshold this page named before any measurement,
+"more than about 60 cycles per partial makes it a four-partial machine",
+is met by the exact kernel and only just escaped by the perceptual one;
+the reverb turned out half again as expensive as assumed, the transport as
+cheap as assumed, and the control five times as expensive.
 
 The host has its own budget, and it is smaller:
 
@@ -399,31 +510,50 @@ The host has its own budget, and it is smaller:
 | exact | 4.67 ms | 2.8 |
 | perceptual | 3.89 ms | 3.4 |
 
-A Falcon MT-32 built from these kernels is therefore **six synth partials
-on the DSP and three PCM partials on the 68030** — a few timbres at a time,
-not a nine-part module — and the PCM side is the tighter of the two,
-because most of the MT-32's characteristic timbres open with a PCM partial
-and three of them sound at most three such notes at once.
+A Falcon MT-32 built from these kernels is therefore **five or six synth
+partials on the DSP and three PCM partials on the 68030** — a few timbres
+at a time, not a nine-part module — and the PCM side is the tighter of the
+two, because most of the MT-32's characteristic timbres open with a PCM
+partial and three of them sound at most three such notes at once.
 
 ## The levers, in the order they should be tried
 
 The measurements change the order. Fewer partials is no longer a lever but
 the starting condition, and the partial itself is close to its floor.
 
-1. **Block-rate control** is assumed by both kernels already: amp, pitch and
-   cutoff are constants inside the loop. The cost of *updating* them once
-   per 32-frame block is the "about 20" above and has not been measured;
-   `TVA`, `TVF` and `TVP` do a few dozen integer operations each per event,
-   so it is unlikely to matter next to the partial itself.
-2. **Move work to the 68030.** PCM partials have to move anyway — see
-   [`architecture.md`](architecture.md#the-pcm-rom-problem) — and now that
-   the host is measured too, there is nothing to move: it is full at three
-   PCM partials, and every synth partial moved there would cost more than
-   a PCM one. The levers on the host side are small: blind host-port
-   writes, which TOS's own block transfer already relies on, would cut the
-   2.33 ms of feeding the DSP to about 1.5; a mono PCM mix panned on the
-   DSP would halve it again; and mixing a part's PCM partials before
-   panning saves two of the three multiplies per additional partial.
+1. **Cheaper control.** The per-block derivation is measured at its worst
+   case and in its first version; deriving only what changed, replacing
+   the `rep` shifts, and letting the host send records only when a control
+   moved would take the 114 cycles of six partials at sixteen frames down
+   toward the 28 of 64-frame blocks for every partial in its sustain. This
+   is the one lever that gives a whole partial back, and it costs nothing
+   in accuracy.
+2. **Move work between the halves.** The DSP is the busier chip in the
+   planned configuration, at about 95 % with six partials and the reverb,
+   and the host at about 90 % with three PCM partials and the transport,
+   before MIDI, envelopes and allocation; neither has idle time to give
+   the other. The one exchange that pays is the PCM partials' pan and mix:
+   rendered mono on the host they cost 2.94 ms instead of 3.89, and a DSP
+   that takes each partial as its own 512-word stream pans and mixes it for
+   6 cycles per frame — the 3 of the receive interrupt, a read and two
+   multiply-accumulates — where the host paid 47 for two multiplies and 9
+   for a store. The host pays the stream instead, 1.16 ms per partial and
+   period with the paced blast, about 0.8 with blind writes, which TOS's
+   own block transfer already relies on:
+
+   | Design | Host time for N PCM partials | N that fits 15.62 ms | DSP cycles per frame |
+   | --- | --- | ---: | ---: |
+   | stereo mix on the host | 2.33 + 3.89 N | 3.4 | 0 |
+   | mono streams, DSP pans, paced | 4.10 N | 3.8 | 6 N |
+   | mono streams, DSP pans, blind | 3.71 N | 4.2 | 6 N |
+   | one mono bus per part, DSP pans, blind | 2.94 N + 0.77 parts | 4.4 at three parts | 6 parts |
+
+   One PCM partial more on the host for about a quarter of a synth
+   partial on the DSP, which is worth it only because the PCM side is the
+   tighter one. Everything else stays where it is: the interpolation needs
+   the ROM, the envelopes need the timbre and the note, and the polled
+   receive's 59 cycles of waiting are not idle time to spend but a cost the
+   interrupt receive removes.
 3. **A cheaper reverb.** The reverb is now the largest single item after the
    partials themselves. Its clip, its dry and wet scalings and its exact
    floors are the price of matching Munt word for word; a perceptual reverb
@@ -449,8 +579,8 @@ absolute one: 262,144 samples against 32,768 words of SRAM.
 
 ## The experiments that would settle this
 
-Each of these is small. They are listed in dependency order; the first five
-are done.
+Each of these is small. They are listed in dependency order; all six are
+done.
 
 1. ~~**Cost one synth partial.**~~ Done: 77 and 100 cycles per frame,
    bit-exact. `make profile-partial CFG=0..3` reproduces it.
@@ -467,8 +597,10 @@ are done.
    and 3.89 ms perceptually, against the 13.29 ms left after the
    transport, so three PCM partials. `make profile-pcm CFG=0..7` reproduces
    it, and the program's own tick count repeats it on hardware.
-6. **Find the control rate.** With one partial working, hold its envelopes
-   and LFO across 1, 8, 32 and 64 frames and compare against the oracle.
+6. ~~**Find the control rate.**~~ Done: sixteen frames with the amp
+   ramped inside the block, 32 when no filter attack is running; the
+   derivation costs 303 cycles per block and partial. `make control-sweep`
+   and `make profile-controls` reproduce it.
 
 ## What would make the project not worth doing
 
@@ -487,7 +619,7 @@ one: 53 to 64 cycles and a 92-cycle reverb buy five or six partials, not
 eight. The second is measured now as well: the host carries three PCM
 partials, and the sounds the MT-32 is remembered for open with one each.
 The project is therefore only worth continuing as a deliberately reduced
-machine — the perceptual partials, six on the DSP and three on the 68030,
-a few timbres at a time — and whether a three-note MT-32 is worth having
-is a question about the music it would be asked to play, not about the
-Falcon, which has now been measured on every axis this page named.
+machine — the perceptual partials, five or six on the DSP and three on the
+68030, a few timbres at a time — and whether a three-note MT-32 is worth
+having is a question about the music it would be asked to play, not about
+the Falcon, which has now been measured on every axis this page named.

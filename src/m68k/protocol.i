@@ -31,13 +31,26 @@ LA32_PROFILE_FRAMES equ     2048
 LA32_PROFILE_CONFIGS equ    10
 LA32_PROFILE_FIRST_REVERB equ 8
 
+; Control-rate spike (docs/la32-budget.md): the DSP takes a payload - the
+; kernel's static constants, two per-partial terms, a block length and
+; count, then one record of amp >> 10, pitch and cutoff >> 3 per block -
+; and renders LA32_PROFILE_FRAMES frames, deriving its constants from each
+; record before the block, as a host running the envelopes would have it
+; do. It replies with the output buffer's fold. The marker PING carries the
+; run in bits 4-7 and the block-length code in bits 0-3.
+MT32_CMD_CONTROL_RUN equ    $0b0000
+MT32_CONTROL_MARKER equ     $01c300
+LA32_CONTROL_HEADER equ     22
+LA32_CONTROL_CONFIGS equ    8
+LA32_CONTROL_LENGTHS equ    4
+
 ; 68030 PCM partial spike (docs/la32-budget.md): the host renders one PCM
 ; partial itself and writes the checked frames to PCMOUT.BIN; two PINGs
 ; carrying these markers, the low byte naming the run, bracket the timed
 ; render for the Hatari CPU profiler. The DSP only echoes them.
 MT32_PCM_MARKER_BEGIN equ   $01c100
 MT32_PCM_MARKER_END equ     $01c200
-PCM_PROFILE_CONFIGS equ     8
+PCM_PROFILE_CONFIGS equ     12
 PCM_PROFILE_FRAMES equ      2048
 PCM_TIMING_PERIODS equ      128
 
