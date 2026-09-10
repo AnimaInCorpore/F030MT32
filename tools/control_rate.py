@@ -23,12 +23,15 @@ This tool answers the first with the oracle alone and the second on the DSP:
   controls - the words a host running the envelopes would send per block;
 * the Makefile's `profile-control` runs one scenario on the DSP with a
   block length, where `la32_block_derive` turns each record into the
-  kernel's constants, compares the output with the oracle's held render,
-  and reports the cycles per frame including the derivation.
+  kernel's constants - only what the record changed - compares the output
+  with the oracle's held render, and reports the cycles per frame; the
+  `summarize` command splits the profile into the kernel's cost per frame
+  and the derivation's, the position install's and the loop's per block.
 
 The scenarios are the MT-32's envelope vocabulary at its extremes: the
 fastest TVA and TVF attack the ROM can ask for, a slow string swell with
-vibrato, a brass sweep, and a fast release.
+vibrato, a brass sweep, a fast release, and - to measure the derivation's
+cheap paths - a settled sustain and a vibrato over settled amp and cutoff.
 """
 
 from __future__ import annotations
@@ -104,6 +107,16 @@ SCENARIOS = [
     Scenario("release", False, 160, 4, 6, key_pitch(48, False), 200, 0, 0,
              ((230, IMMEDIATE), (0, 0x80 | 118), (0, 0)),
              ((60, IMMEDIATE), (0, 0x80 | 100), (0, 0))),
+    # Every control settled from the first frame: the sustain of a note,
+    # where a derivation that skips what did not change earns its keep.
+    Scenario("sustain", True, 128, 16, 6, key_pitch(64, True), 140, 0, 0,
+             ((220, IMMEDIATE), (220, 0)),
+             ((30, IMMEDIATE), (30, 0))),
+    # Settled amp and cutoff under a 6 Hz vibrato of 18 cents: only the
+    # pitch moves, so only the step is derived.
+    Scenario("vibrato", True, 110, 10, 8, key_pitch(69, True), 150, 60, 5461,
+             ((225, IMMEDIATE), (225, 0)),
+             ((25, IMMEDIATE), (25, 0))),
 ]
 KERNELS = ["exact", "perceptual"]
 
@@ -268,6 +281,56 @@ def compare(dump: Path, oracle_frames: Path, run_index: int) -> int:
     return compare_dump(dump, oracle_frames, RUNS[run_index])
 
 
+KERNEL_LOOPS = {"la32_square_loop", "la32_saw_loop", "la32_psquare_loop", "la32_psaw_loop"}
+KERNEL_ENTRIES = {
+    "la32_square_run", "la32_saw_run", "la32_psquare_run", "la32_psaw_run",
+    "la32_square_done", "la32_saw_done", "la32_psquare_done", "la32_psaw_done",
+}
+POSITION_LABELS = {"la32_block_positions", "la32_positions_perceptual"}
+LOOP_LABELS = {"la32_control_loop", "la32_control_steady", "la32_control_next"}
+
+
+def summarize(listing: Path, profile: Path, block: int, output: Path | None) -> None:
+    """Instruction cycles per frame for the kernel and per block for the rest."""
+    import bisect
+    from profile_dsp import parse_listing as parse, parse_profile
+    symbols = parse(listing)
+    labels = sorted((address, name) for (space, name), address in symbols.items() if space == "P")
+    addresses = [address for address, _ in labels]
+    _hz, _total, rows = parse_profile(profile)
+    groups: dict[str, float] = {"kernel": 0.0, "derivation": 0.0, "positions": 0.0,
+                                "loop": 0.0, "entry and exit": 0.0, "other": 0.0}
+    for pc, _instructions, cycles, _percent in rows:
+        index = bisect.bisect_right(addresses, pc) - 1
+        name = labels[index][1] if index >= 0 else ""
+        c = cycles / 2.0
+        if name in KERNEL_LOOPS:
+            groups["kernel"] += c
+        elif name.startswith("la32_derive") or name == "la32_block_derive":
+            groups["derivation"] += c
+        elif name in POSITION_LABELS:
+            groups["positions"] += c
+        elif name in LOOP_LABELS:
+            groups["loop"] += c
+        elif name in KERNEL_ENTRIES:
+            groups["entry and exit"] += c
+        else:
+            groups["other"] += c
+    blocks = FRAMES // block
+    per_block = sum(v for k, v in groups.items() if k != "kernel")
+    lines = [
+        f"  blocks of {block}: kernel {groups['kernel'] / FRAMES:6.2f} cycles per frame; per block: "
+        f"derivation {groups['derivation'] / blocks:6.1f}, positions {groups['positions'] / blocks:5.1f}, "
+        f"loop {groups['loop'] / blocks:5.1f}, entry and exit {groups['entry and exit'] / blocks:5.1f}, "
+        f"other {groups['other'] / blocks:5.1f} = {per_block / blocks:6.1f} "
+        f"({per_block / FRAMES:5.2f} per frame)",
+    ]
+    text = "\n".join(lines) + "\n"
+    print(text, end="")
+    if output:
+        output.write_text(text)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -295,6 +358,12 @@ def main() -> None:
     p.add_argument("--dump", type=Path, required=True)
     p.add_argument("--oracle", type=Path, required=True)
     p.add_argument("run", type=int)
+    p = sub.add_parser("summarize", help="split a control run's DSP profile into kernel and per-block costs")
+    p.add_argument("--listing", type=Path, required=True)
+    p.add_argument("--profile", type=Path, required=True)
+    p.add_argument("--output", type=Path)
+    p.add_argument("run", type=int)
+    p.add_argument("--ncode", type=int, default=0)
     sub.add_parser("count")
     args = parser.parse_args()
 
@@ -322,9 +391,11 @@ def main() -> None:
     elif args.command == "marker":
         print(f"{MARKER | (args.run << 4) | args.ncode:#08x}")
     elif args.command == "cfg":
-        print(f"C{args.run}{args.ncode}")
+        print(f"C{args.run:02d}{args.ncode}")
     elif args.command == "block":
         print(BLOCK_LENGTHS[args.ncode])
+    elif args.command == "summarize":
+        summarize(args.listing, args.profile, BLOCK_LENGTHS[args.ncode], args.output)
 
 
 if __name__ == "__main__":

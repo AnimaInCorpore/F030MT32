@@ -41,7 +41,7 @@ LA32_PROFILE_FIRST_REVERB equ 8
 MT32_CMD_CONTROL_RUN equ    $0b0000
 MT32_CONTROL_MARKER equ     $01c300
 LA32_CONTROL_HEADER equ     22
-LA32_CONTROL_CONFIGS equ    8
+LA32_CONTROL_CONFIGS equ    12
 LA32_CONTROL_LENGTHS equ    4
 
 ; 68030 PCM partial spike (docs/la32-budget.md): the host renders one PCM

@@ -50,12 +50,13 @@ two are answered and the answers are hard:
    and 100 as a sawtooth when it reproduces Munt bit for bit, and 53 and 64
    when it leaves the log domain through single-table lookups within a few
    output words of Munt; the reverb costs 92, the transport 12, and the
-   controls, which must move every 16 frames, 19 per partial**, against a
-   budget of 489.40 per frame. After the transport, the reverb and the
-   control take their share, that is five or six perceptual partials on
-   the DSP — a few timbres at a time, not a nine-part module — and nothing
-   that keeps the LA32's wave shape can reach the 15 cycles that thirty-two
-   partials would need. See [`docs/la32-budget.md`](docs/la32-budget.md).
+   controls, which must move every 16 frames, 4 per partial once a note
+   has settled and 15 while its filter moves**, against a budget of 489.40
+   per frame. After the transport, the reverb and the control take their
+   share, that is five or six perceptual partials on the DSP — a few
+   timbres at a time, not a nine-part module — and nothing that keeps the
+   LA32's wave shape can reach the 15 cycles that thirty-two partials would
+   need. See [`docs/la32-budget.md`](docs/la32-budget.md).
 2. **The PCM ROM does not fit and never will, and the 68030 carries three
    PCM partials.** The ROM is 262,144 samples against 32,768 words of
    Falcon DSP SRAM, so the 68030 renders PCM partials and streams the
@@ -138,7 +139,7 @@ make check
 | `make profile-pcm CFG=n` | render one PCM partial on the 68030, check it against the oracle and report its cost per period: runs 0-3 the exact kernel, 4-7 the perceptual one, 8-11 the mono one | Hatari |
 | `make profile-pcms` | the same for every PCM run | Hatari |
 | `make control-sweep` | grade held controls against Munt's per-sample controls with the oracle alone, for block lengths of 2 to 128 frames | C++17 |
-| `make profile-control CFG=n NCODE=m` | render control run `n` on the DSP with blocks of 8, 16, 32 or 64 frames (`m` = 0..3), deriving the kernel constants per block, check it against the oracle's held render and report | Hatari |
+| `make profile-control CFG=n NCODE=m` | render control run `n` (0-11: six scenarios, exact then perceptual) on the DSP with blocks of 8, 16, 32 or 64 frames (`m` = 0..3), deriving the kernel constants per block, check it against the oracle's held render and report the kernel and per-block costs | Hatari |
 | `make profile-controls` | the same for every run and block length | Hatari |
 | `make verbose` | build the traced bring-up executable | DOSBox |
 | `make run` | launch the self-test executable in Hatari | Hatari |
@@ -224,7 +225,9 @@ The intended contracts, in the order they have to be established:
    against Munt from the file the program writes. `make control-sweep`
    finds the control rate against Munt's per-sample envelopes, and
    `make profile-controls` measures the DSP deriving its constants per
-   block: 303 cycles per block and partial, bit-exact.
+   block, only what each block's record changed: 230 to 260 cycles per
+   block and partial while the filter moves, 66 once the note has settled,
+   bit-exact.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the
    production renderer — the same two-tier split F030MXDRV uses against

@@ -55,8 +55,9 @@ with 32 serving once no filter attack is running; the pitch is already
 re-evaluated only every eight samples by the MT-32's own MCU. So the host
 sends each partial's amp, pitch and cutoff — three words — per sixteen-frame
 block, aligned to its envelope's segment starts, and the DSP derives the
-kernel's constants from them, which costs 303 cycles per block and partial
-in its first version.
+kernel's constants from whatever the record changed, which costs 230 to
+260 cycles per block and partial while the filter moves and 66 once the
+note has settled.
 
 The second option is not free of consequences and they should be written down
 before anyone is surprised by them:

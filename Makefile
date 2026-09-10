@@ -601,7 +601,7 @@ profile-control: check tools/control_rate.py tools/profile_dsp.py
 		--output-dir $(CONTROL_PROFILE_RUN) \
 		--marker $$(python3 tools/control_rate.py marker $(CFG) --ncode $(NCODE)) \
 		--start-symbol la32_control_loop --end-symbol la32_control_done \
-		--marker-space y --dump x:0x1000-0x1fff
+		--marker-space y --dump x:0x1000-0x1fff --dump y:0x10-0x7f
 	@printf '%s' "$$(python3 tools/control_rate.py cfg $(CFG) --ncode $(NCODE))" \
 		> $(RELEASE_DIR)/PROFILE.CFG
 	@cd $(RELEASE_DIR) && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(HATARI) \
@@ -634,6 +634,10 @@ profile-control: check tools/control_rate.py tools/profile_dsp.py
 		--samples 2048 --sample-rate 32779.947916 \
 		--unit-label "codec frame" \
 		--title "DSP56001 control run $(CFG) ($$(python3 tools/control_rate.py name $(CFG) --ncode $(NCODE)))"
+	@python3 tools/control_rate.py summarize \
+		--listing $(DSP_BUILD)/LA32.LST \
+		--profile $(CONTROL_PROFILE_RUN)/profile.txt \
+		--output $(CONTROL_PROFILE_RUN)/summary.txt $(CFG) --ncode $(NCODE)
 
 profile-controls:
 	@for cfg in $$(seq 0 $$(( $$(python3 tools/control_rate.py count) - 1 ))); do \

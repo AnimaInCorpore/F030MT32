@@ -146,6 +146,16 @@ rv_outr3        ds      1               ; scratch: comb 3's last word
 ; beside ALU work. la32_tables_install copies the fixed words from P at boot;
 ; command_profile copies a configuration block over la_step3 onwards. The
 ; layout is mirrored by tools/la32_partial.py.
+; Block-derivation scratch, short-addressable beside the transport state.
+        org     y:$9
+la_scr_ampt     ds      1               ; the record's amp >> 10
+la_scr_ecv      ds      1               ; effective cutoff value
+la_scr_rwlf4    ds      1               ; resonance wave length factor << 4
+la_scr_hl4      ds      1               ; high linear length >> 4
+la_scr_ll4      ds      1               ; low linear length >> 4
+la_cut_amp      ds      1               ; the cutoff's square amp term, 0 above the middle
+la_cut_res      ds      1               ; ras + the cutoff's resonance term - 4096
+
         org     y:$10
 la_wp3          ds      1               ; wave position << 3, advanced per frame
 la_wphmask      ds      1               ; $7ff800 - first fixed word
@@ -188,6 +198,9 @@ la_half0        ds      4               ; per half, exact: sign base, linear len
 la_half1        ds      4               ;   decay << 15, square sign multiplier;
                                         ; perceptual: linear length, sine table base,
                                         ;   decay << 15, signed square gain
+la_entry        ds      1               ; control run: the kernel entry
+la_rest         ds      1               ; control run: block length - 1
+la_poschg       ds      1               ; control run: the position constants changed
 
 ; Control-run state, past the short-absolute range: the per-block derivation
 ; is the only reader and can afford long addressing.
@@ -195,12 +208,6 @@ la_half1        ds      4               ;   decay << 15, square sign multiplier;
 la_epw          ds      1               ; effective pulse width term, static per partial
 la_ras          ds      1               ; resonance amp subtraction, static per partial
 la_record       ds      1               ; next control record
-la_scr_ampt     ds      1               ; the record's amp >> 10
-la_scr_c        ds      1               ; the record's cutoff >> 3, clamped
-la_scr_ecv      ds      1               ; effective cutoff value
-la_scr_rwlf4    ds      1               ; resonance wave length factor << 4
-la_scr_hl4      ds      1               ; high linear length >> 4
-la_scr_ll4      ds      1               ; low linear length >> 4
 la_recbase      ds      1               ; the first control record
 la_blocklen     ds      1               ; frames per block
 ; Munt applies a sample's pitch and cutoff to the wave position one sample
@@ -209,6 +216,10 @@ la_blocklen     ds      1               ; frames per block
 la_pend_step3   ds      1
 la_pend_k7      ds      1
 la_pend_b3      ds      1
+la_prev_pitch   ds      1               ; the previous block's pitch, or -1
+la_prev_c       ds      1               ; the previous block's cutoff >> 3, or -1
+la_pow_guard    ds      9               ; zeros: a shift that clears the value
+la_pow          ds      24              ; 2^0 .. 2^22, then a zero for a shift of none
 
 ; Control records land here from the host port: LA32_CONTROL_HEADER words
 ; then three per block, below the X table alias at P:$4000.
@@ -1101,6 +1112,10 @@ command_control_installed:
         move    x0,y:>la_ras
         move    y:(r1)+,x0
         move    x0,y:>la_blocklen
+        move    x0,a
+        move    #>1,x1
+        sub     x1,a
+        move    a1,y:<la_rest
         move    y:(r1)+,a
         move    a1,y:<la_blocks
         move    r1,y:>la_recbase
@@ -1113,6 +1128,10 @@ command_control_installed:
         movep   x:m_hrx,a
         move    a1,y:(r0)+
 command_control_records:
+        jsr     la32_kernel_entry
+        move    #>-1,x0
+        move    x0,y:>la_prev_pitch
+        move    x0,y:>la_prev_c
         move    y:>la_recbase,x0
         move    x0,y:>la_record
         jsr     la32_block_derive
@@ -1120,26 +1139,65 @@ command_control_records:
         jsr     profile_prepare
         move    y:>la_recbase,x0
         move    x0,y:>la_record
-        ; Per block: derive, render the first frame with the previous
-        ; block's position constants and this block's amp, install the
-        ; position constants, render the rest.
+        move    #>-1,x0                 ; block 0 derives again inside the window
+        move    x0,y:>la_prev_pitch
+        move    x0,y:>la_prev_c
+        ; Per block: derive what the record changed. When the position
+        ; constants changed, render the first frame with the previous
+        ; block's, install, and render the rest, as Munt orders them;
+        ; otherwise render the block in one call.
         do      y:<la_blocks,la32_control_done
 la32_control_loop:
         jsr     la32_block_derive
+        move    y:<la_poschg,a
+        tst     a
+        jeq     la32_control_steady
         move    #>1,x0
         move    x0,y:<la_frames
-        jsr     la32_kernel_run
+        move    y:<la_entry,r0
+        nop
+        jsr     (r0)
         jsr     la32_block_positions
-        move    y:>la_blocklen,a
-        move    #>1,x0
-        sub     x0,a
-        move    a1,y:<la_frames
-        jsr     la32_kernel_run
+        move    y:<la_rest,x0
+        move    x0,y:<la_frames
+        move    y:<la_entry,r0
+        nop
+        jsr     (r0)
+        jmp     la32_control_next
+la32_control_steady:
+        move    y:>la_blocklen,x0
+        move    x0,y:<la_frames
+        move    y:<la_entry,r0
+        nop
+        jsr     (r0)
+la32_control_next:
         nop
 la32_control_done:
         jsr     profile_fold
         jsr     send_reply
         jmp     command_loop
+
+; The run's kernel entry, from the kernel and wave words, so a block costs
+; one indirect call instead of the compare chain.
+la32_kernel_entry:
+        move    y:<la_kernel,b
+        tst     b
+        jne     la32_kernel_entry_perceptual
+        move    #>la32_square_run,a
+        move    #>la32_saw_run,x1
+        move    y:<la_saw,b
+        tst     b
+        tne     x1,a
+        move    a1,y:<la_entry
+        rts
+la32_kernel_entry_perceptual:
+        move    #>la32_psquare_run,a
+        move    #>la32_psaw_run,x1
+        move    y:<la_saw,b
+        tst     b
+        tne     x1,a
+        move    a1,y:<la_entry
+        rts
 
 ; Move a block's pending position constants into the kernel's words.
 la32_block_positions:
@@ -1152,73 +1210,88 @@ la32_block_positions:
         move    y:<la_kernel,a
         tst     a
         jne     la32_positions_perceptual
-        move    y:>la_scr_hl4,x0
+        move    y:<la_scr_hl4,x0
         move    x0,y:<la_half0+1
-        move    y:>la_scr_ll4,x0
+        move    y:<la_scr_ll4,x0
         move    x0,y:<la_half1+1
         rts
 la32_positions_perceptual:
-        move    y:>la_scr_hl4,x0
+        move    y:<la_scr_hl4,x0
         move    x0,y:<la_half0
-        move    y:>la_scr_ll4,x0
+        move    y:<la_scr_ll4,x0
         move    x0,y:<la_half1
         rts
 
 ; Derive the kernel's block constants from one control record of amp >> 10,
-; pitch and cutoff >> 3, as LA32WaveGenerator does per sample: the sample
-; step, the effective cutoff and its resonance wave-length factor, the
-; segment lengths, the square's amp term and the resonance's base, in the
-; S4 units the kernels use, plus the perceptual square gain. interpolateExp
-; comes from the exact unlog table, which holds it << 8 at X:0; shifts by
-; data-dependent counts run in the accumulator under rep, by one more than
-; needed and corrected where the count could be zero. Scratches r0, r2 and
-; every data register; the kernels' r3-r7 survive.
+; pitch and cutoff >> 3, as LA32WaveGenerator does per sample, but only
+; what the record changed: the step when the pitch moved; the effective
+; cutoff, the resonance wave-length factor, the segment lengths and the
+; cutoff's two log terms when the cutoff moved; the amp's two words and the
+; perceptual gain every block, since the amp moves in every envelope phase.
+; The host clamps the cutoff. interpolateExp comes from the exact unlog
+; table, which holds it << 8 at X:0; a right shift by a data-dependent
+; count is a multiply by a power of two from la_pow, a left shift runs asl
+; under rep by at least one. Sets la_poschg when the position constants -
+; step, k7, b3, the linear lengths - changed. Scratches r0-r2 and every
+; data register; the kernels' r3-r7 survive.
 la32_block_derive:
         move    y:>la_record,r2
         nop
         move    y:(r2)+,a               ; amp >> 10
-        move    a1,y:>la_scr_ampt
-        move    y:(r2)+,y1              ; pitch
+        move    a1,y:<la_scr_ampt
+        move    y:(r2)+,x0              ; pitch
         move    y:(r2)+,b               ; cutoff >> 3
         move    r2,y:>la_record
-; step = (interpolateExp(~pitch & 4095) << (pitch >> 12)) >> 8, made even; << 3
-        move    y1,a
-        move    #>4095,x1
+        move    #>0,x1
+        move    x1,y:<la_poschg
+; step = (interpolateExp(~pitch & 4095) << (pitch >> 12)) >> 8, even, << 3
+        move    x0,a
+        move    y:>la_prev_pitch,x1
+        cmp     x1,a
+        jeq     la32_derive_pitch_same
+        move    x0,y:>la_prev_pitch
+        move    y:<la_m4095,x1
         not     a
         and     x1,a
-        move    a1,r0
-        move    y:<la_sh12,y0           ; pitch >> 12 by a multiply
-        mpy     y1,y0,a
+        move    a1,r0                   ; ~pitch & 4095
+        move    y:<la_sh12,y0
+        mpy     x0,y0,a                 ; pitch >> 12
         move    a1,x1
-        move    #>16,a
-        sub     x1,a                    ; a1 = 16 - (pitch >> 12), at least 2
-        move    a1,x1
-        move    x:(r0),a                ; interpolateExp << 8
-        rep     x1
-        asr     a
+        move    #>la_pow+7,a
+        add     x1,a
+        move    a1,r1                   ; 2^(7 + pitch >> 12): the shift by 16 - (pitch >> 12)
+        move    x:(r0),x1
+        move    y:(r1),y0
+        mpy     x1,y0,a                 ; the step, odd bit and all
         move    #>$fffffe,x1
         and     x1,a
         move    a1,x1
-        move    x1,a                    ; drop the fraction below a1
+        move    x1,a
         rep     #3
         asl     a
         move    a1,y:>la_pend_step3
-; cutoff: clamp at 240, the effective cutoff above the middle
-        move    #>$780000,x1            ; 240 << 15
+        move    #>1,x1
+        move    x1,y:<la_poschg
+la32_derive_pitch_same:
+; the cutoff's constants, when it moved
+        move    y:>la_prev_c,x1
         cmp     x1,b
-        tgt     x1,b
-        move    b1,y:>la_scr_c
+        jeq     la32_derive_cutoff_same
+        move    b1,y:>la_prev_c
+        move    #>1,x1
+        move    x1,y:<la_poschg
+; effective cutoff: (cutoff - middle) >> 7 above the middle, else 0
         move    #>$400000,x1            ; 128 << 15
         tfr     b,a
-        sub     x1,a                    ; cutoff - middle
+        sub     x1,a
         move    #>0,x0
         tmi     x0,a
         move    a1,x1
         move    #>$10000,y0             ; 2^16: a right shift by 7
         mpy     x1,y0,a
-        move    a1,y:>la_scr_ecv
-; resonance wave-length factor << 4, and (rwlf >> 4) << 7 for the kernel
-        move    #>4095,x1
+        move    a1,y:<la_scr_ecv
+; resonance wave-length factor << 4 = (interpolateExp << 8 >> 5) << (ecv >> 12 + 1)
+        move    y:<la_m4095,x1
         tfr     a,b
         not     b
         and     x1,b
@@ -1228,82 +1301,79 @@ la32_block_derive:
         mpy     x1,y0,a                 ; ecv >> 12
         move    #>1,y1
         add     y1,a
-        move    a1,x1                   ; shift count + 1
-        move    x:(r0),a
+        move    a1,x1                   ; the left shift, at least one
+        move    x:(r0),y0
+        move    y:<la_sh5,x0            ; 2^18: a right shift by 5
+        mpy     y0,x0,a
         rep     x1
         asl     a
-        rep     #5
+        move    a1,y:<la_scr_rwlf4
+; (rwlf >> 4) << 7 = (rwlf4 >> 1) & ~127, shifted in the accumulator: at the
+; cutoff ceiling rwlf4 reaches 2^23, one bit more than a data register holds
         asr     a
-        move    a1,y:>la_scr_rwlf4
-        rep     #8
-        asr     a
-        move    a1,x1
-        move    x1,a
-        rep     #7
-        asl     a
+        move    #>$ffff80,x1
+        and     x1,a
         move    a1,y:>la_pend_k7
-; high linear length >> 4: (interpolateExp(~arg & 4095) << (arg >> 12)) >> 5 - 2^15
+; high linear length >> 4 = (interpolateExp << 8 >> 6) << (arg >> 12 + 1) - 2^15
 ; while the pulse-width term is below the effective cutoff, else 0
-        move    y:>la_scr_ecv,a
+        move    y:<la_scr_ecv,a
         move    y:>la_epw,x1
         cmp     x1,a
         jle     la32_derive_no_high
         sub     x1,a
-        move    a1,y1
-        move    #>4095,x1
+        move    a1,x0
+        move    y:<la_m4095,x1
         tfr     a,b
         not     b
         and     x1,b
         move    b1,r0
         move    y:<la_sh12,y0
-        move    y1,x1
-        mpy     x1,y0,a                 ; arg >> 12
+        mpy     x0,y0,a                 ; arg >> 12
         move    #>1,y1
         add     y1,a
         move    a1,x1
-        move    x:(r0),a
+        move    x:(r0),y0
+        move    #>$20000,x0             ; 2^17: a right shift by 6
+        mpy     y0,x0,a
         rep     x1
         asl     a
-        rep     #6
-        asr     a
         move    #>$8000,x1
         sub     x1,a
-        move    a1,y:>la_scr_hl4
+        move    a1,y:<la_scr_hl4
         jmp     la32_derive_high_done
 la32_derive_no_high:
         move    #>0,x1
-        move    x1,y:>la_scr_hl4
+        move    x1,y:<la_scr_hl4
 la32_derive_high_done:
 ; the negative half's start and the low linear length, S4 units
-        move    y:>la_scr_hl4,a
+        move    y:<la_scr_hl4,a
         move    #>$8000,x1
         add     x1,a
         move    a1,y:>la_pend_b3
-        move    y:>la_scr_rwlf4,a
+        move    y:<la_scr_rwlf4,a
         move    #>$10000,x1
         sub     x1,a
-        move    y:>la_scr_hl4,x1
+        move    y:<la_scr_hl4,x1
         sub     x1,a
-        move    a1,y:>la_scr_ll4
-; the square's amp term and the resonance base
-        move    y:>la_scr_ampt,a
+        move    a1,y:<la_scr_ll4
+; the cutoff's square amp term, and the resonance base without the amp
+        move    y:>la_prev_c,x1
         move    #>$400000,b
-        move    y:>la_scr_c,x1
         sub     x1,b                    ; middle - cutoff
         jle     la32_derive_cutoff_high
         move    b1,x1
         move    #>$20000,y0             ; 2^17: a right shift by 6
-        mpy     x1,y0,b                 ; the low-cutoff term
+        mpy     x1,y0,b
         move    b1,x1
-        add     x1,a
-        move    a1,y:<la_ampt
+        move    x1,y:<la_cut_amp
         move    x1,b
         move    #>31743,y1
         add     y1,b                    ; the resonance's cutoff term
-        jmp     la32_derive_rbase
+        jmp     la32_derive_cutoff_done
 la32_derive_cutoff_high:
-        move    a1,y:<la_ampt
-        move    y:>la_scr_c,x1
+        move    #>0,x1
+        move    x1,y:<la_cut_amp
+        move    y:>la_prev_c,x1
         move    #>$480000,b             ; 144 << 15: the decay threshold
         cmp     x1,b
         jle     la32_derive_cutoff_zero
@@ -1319,45 +1389,53 @@ la32_derive_cutoff_high:
         move    b1,r0
         nop
         move    y:(r0),b                ; logsin9 << 2
-        jmp     la32_derive_rbase
+        jmp     la32_derive_cutoff_done
 la32_derive_cutoff_zero:
         move    #>0,b
-la32_derive_rbase:
-        move    y:>la_scr_ampt,a
-        move    y:>la_ras,x1
-        add     x1,a
+la32_derive_cutoff_done:
+        move    y:>la_ras,a
         move    b1,x1
         add     x1,a
         move    #>4096,x1
         sub     x1,a
+        move    a1,y:<la_cut_res
+la32_derive_cutoff_same:
+; the amp's words, every block
+        move    y:<la_scr_ampt,a
+        move    y:<la_cut_res,x1
+        add     x1,a
         move    a1,y:<la_rbase
-; the perceptual kernel's signed square gain applies with the amp
-        move    y:<la_kernel,a
-        tst     a
-        jne     la32_derive_perceptual
-        rts
-la32_derive_perceptual:
-; gain = (interpolateExp(ampt & 4095) << 8) >> (ampt >> 12), from the amp term
-        move    y:<la_ampt,a
-        move    #>4095,x1
+        move    y:<la_scr_ampt,a
+        move    y:<la_cut_amp,x1
+        add     x1,a
+        move    a1,y:<la_ampt
+        move    y:<la_kernel,b
+        tst     b
+        jeq     la32_derive_done
+; the perceptual gain = (interpolateExp(ampt & 4095) << 8) >> (ampt >> 12)
+        move    y:<la_m4095,x1
         tfr     a,b
         and     x1,b
         move    b1,r0
         move    a1,x1
         move    y:<la_sh12,y0
-        mpy     x1,y0,a                 ; ampt >> 12
-        move    #>1,y1
-        add     y1,a
+        mpy     x1,y0,a                 ; the shift, 0 to 32
         move    a1,x1
-        move    x:(r0),a
-        rep     x1
-        asr     a
-        asl     a
+        move    #>la_pow+23,a
+        sub     x1,a
+        move    a1,r1                   ; 2^(23 - shift), zero beyond the table
+        move    x:(r0),y0
+        move    y:(r1),x0
+        mpy     x0,y0,a                 ; the gain, except for a shift of none
+        move    x1,b
+        tst     b
+        teq     y0,a                    ; a shift of none keeps the table value
         move    a1,x1
+        move    x1,y:<la_half0+3
         move    x1,a
         neg     a
-        move    x1,y:<la_half0+3
         move    a1,y:<la_half1+3
+la32_derive_done:
         rts
 
 ; Copy the fixed constants into internal Y and the first page of the unlog
@@ -1376,6 +1454,20 @@ la32_const_installed:
         move    p:(r1)+,a
         move    a1,x:(r4)+
 la32_unlog_installed:
+        ; the powers of two the block derivation multiplies by, guarded
+        ; below by zeros and above by one for the shift that keeps the value
+        move    #>la_pow_guard,r4
+        clr     a
+        do      #9,la32_pow_guarded
+        move    a1,y:(r4)+
+la32_pow_guarded:
+        move    #>1,a
+        do      #23,la32_pow_built
+        move    a1,y:(r4)+
+        asl     a
+la32_pow_built:
+        clr     a
+        move    a1,y:(r4)+
         rts
 
         ENDIF

@@ -341,7 +341,7 @@ read_profile_cfg:
         tst.l   d0
         bmi     read_profile_cfg_none
         move.w  d0,d7                   ; handle; GEMDOS preserves d3-d7
-        Fread   d7,#3,profile_cfg_bytes
+        Fread   d7,#4,profile_cfg_bytes
         move.l  d0,d6
         Fclose  d7
         tst.l   d6
@@ -375,10 +375,10 @@ read_profile_cfg_pcm:
         moveq   #MODE_PCM,d0
         rts
 read_profile_cfg_control:
-        cmpi.l  #3,d6
+        cmpi.l  #4,d6
         bne     read_profile_cfg_none
         moveq   #0,d0
-        move.b  profile_cfg_bytes+2,d0
+        move.b  profile_cfg_bytes+3,d0
         subi.b  #'0',d0
         cmpi.b  #LA32_CONTROL_LENGTHS-1,d0
         bhi     read_profile_cfg_none
@@ -386,7 +386,16 @@ read_profile_cfg_control:
         moveq   #0,d0
         move.b  profile_cfg_bytes+1,d0
         subi.b  #'0',d0
-        cmpi.b  #LA32_CONTROL_CONFIGS-1,d0
+        cmpi.b  #9,d0
+        bhi     read_profile_cfg_none
+        mulu.w  #10,d0
+        moveq   #0,d1
+        move.b  profile_cfg_bytes+2,d1
+        subi.b  #'0',d1
+        cmpi.b  #9,d1
+        bhi     read_profile_cfg_none
+        add.l   d1,d0
+        cmpi.l  #LA32_CONTROL_CONFIGS-1,d0
         bhi     read_profile_cfg_none
         move.l  d0,profile_cfg
         moveq   #MODE_CONTROL,d0
@@ -870,7 +879,7 @@ pcm_run_config:
 control_ncode:
         ds.l    1
 profile_cfg_bytes:
-        ds.b    3
+        ds.b    4
         even
 old_left_atten:
         ds.w    1
