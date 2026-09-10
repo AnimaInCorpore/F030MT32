@@ -207,7 +207,7 @@ run_control:
         cmp.l   #MT32_REPLY_HELLO,d0
         bne.s   run_control_failed
         move.l  profile_cfg,d0
-        lsl.l   #2,d0
+        mulu.w  #LA32_CONTROL_LENGTHS,d0
         add.l   control_ncode,d0
         lsl.l   #3,d0                   ; eight bytes per table entry
         lea     ctrl_payload_table,a0

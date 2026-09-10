@@ -32,17 +32,18 @@ LA32_PROFILE_CONFIGS equ    10
 LA32_PROFILE_FIRST_REVERB equ 8
 
 ; Control-rate spike (docs/la32-budget.md): the DSP takes a payload - the
-; kernel's static constants, two per-partial terms, a block length and
-; count, then one record of amp >> 10, pitch and cutoff >> 3 per block -
-; and renders LA32_PROFILE_FRAMES frames, deriving its constants from each
-; record before the block, as a host running the envelopes would have it
-; do. It replies with the output buffer's fold. The marker PING carries the
-; run in bits 4-7 and the block-length code in bits 0-3.
+; kernel's static constants, two per-partial terms, a nominal block length
+; and a record count, then one record per block of the frames it holds
+; for, amp >> 10, pitch and cutoff >> 3 - and renders LA32_PROFILE_FRAMES
+; frames, deriving its constants from each record before its frames, as a
+; host running the envelopes would have it do. It replies with the output
+; buffer's fold. The marker PING carries the run in bits 4-7 and the
+; block-length code in bits 0-3; the last code is the adaptive stream.
 MT32_CMD_CONTROL_RUN equ    $0b0000
 MT32_CONTROL_MARKER equ     $01c300
 LA32_CONTROL_HEADER equ     22
 LA32_CONTROL_CONFIGS equ    12
-LA32_CONTROL_LENGTHS equ    4
+LA32_CONTROL_LENGTHS equ    5
 
 ; 68030 PCM partial spike (docs/la32-budget.md): the host renders one PCM
 ; partial itself and writes the checked frames to PCMOUT.BIN; two PINGs

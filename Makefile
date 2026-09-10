@@ -144,8 +144,9 @@ help:
 	@echo "             oracle alone, for block lengths of 2 to 128 frames"
 	@echo "  profile-control CFG=n NCODE=m"
 	@echo "             render control run n on the DSP with blocks of 8, 16, 32"
-	@echo "             or 64 frames (m = 0..3), deriving the kernel constants"
-	@echo "             per block, check it against the oracle and report"
+	@echo "             or 64 frames (m = 0..3) or with records sent only where"
+	@echo "             a control moved (m = 4), deriving the kernel constants"
+	@echo "             per record, check it against the oracle and report"
 	@echo "  profile-controls"
 	@echo "             the same for every run and block length"
 	@echo "  clean      remove generated build/ and release/ directories"
@@ -593,7 +594,8 @@ profile-control: check tools/control_rate.py tools/profile_dsp.py
 	@test -n "$(CFG)" || { echo "error: profile-control needs CFG=0..7 and NCODE=0..3" >&2; exit 1; }
 	@rm -rf $(CONTROL_PROFILE_RUN)
 	@mkdir -p $(CONTROL_PROFILE_RUN) $(LA32_REFERENCE_DIR)
-	@python3 tools/control_rate.py segments $(CFG) > $(CONTROL_PROFILE_RUN)/segments.txt
+	@python3 tools/control_rate.py segments $(CFG) --ncode $(NCODE) --oracle $(LA32_ORACLE) \
+		> $(CONTROL_PROFILE_RUN)/segments.txt
 	@$(LA32_ORACLE) $$(python3 tools/control_rate.py oracle-args $(CFG) --ncode $(NCODE)) \
 		< $(CONTROL_PROFILE_RUN)/segments.txt > $(CONTROL_PROFILE_REFERENCE)
 	@python3 tools/profile_dsp.py prepare \
@@ -637,11 +639,12 @@ profile-control: check tools/control_rate.py tools/profile_dsp.py
 	@python3 tools/control_rate.py summarize \
 		--listing $(DSP_BUILD)/LA32.LST \
 		--profile $(CONTROL_PROFILE_RUN)/profile.txt \
+		--oracle $(LA32_ORACLE) \
 		--output $(CONTROL_PROFILE_RUN)/summary.txt $(CFG) --ncode $(NCODE)
 
 profile-controls:
 	@for cfg in $$(seq 0 $$(( $$(python3 tools/control_rate.py count) - 1 ))); do \
-		for ncode in 0 1 2 3; do \
+		for ncode in 0 1 2 3 4; do \
 			$(MAKE) --no-print-directory profile-control CFG=$$cfg NCODE=$$ncode || exit 1; \
 		done; \
 	done

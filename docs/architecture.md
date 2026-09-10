@@ -53,11 +53,12 @@ ramped every frame, because the LA32's fastest envelope moves it four
 percent per sample, and the cutoff sets the block length at sixteen frames,
 with 32 serving once no filter attack is running; the pitch is already
 re-evaluated only every eight samples by the MT-32's own MCU. So the host
-sends each partial's amp, pitch and cutoff — three words — per sixteen-frame
-block, aligned to its envelope's segment starts, and the DSP derives the
-kernel's constants from whatever the record changed, which costs 230 to
-260 cycles per block and partial while the filter moves and 66 once the
-note has settled.
+looks at each partial every sixteen frames and sends its amp, pitch and
+cutoff — three words and the frames they hold for — only where one of them
+moved, aligned to its envelope's segment starts, and the DSP derives the
+kernel's constants from whatever the record changed, which costs 240 to
+270 cycles per record and partial while the filter moves and nothing once
+the note has settled.
 
 The second option is not free of consequences and they should be written down
 before anyone is surprised by them:
@@ -295,11 +296,13 @@ Only this much runs:
   format, in an exact, a perceptual and a mono kernel, rendered to a file
   for the oracle comparison and timed between two host-port markers — a
   measurement of the host's half of the split, not a voice;
-- the control-run command: the DSP takes a run's static constants and one
-  record of amp, pitch and cutoff per block from the host and renders block
-  by block, deriving its kernel constants from each record — the block-rate
-  control path, measured against the oracle's held render, with the
-  envelopes themselves still on the oracle's side.
+- the control-run command: the DSP takes a run's static constants and
+  records of amp, pitch and cutoff with the frames each holds for from the
+  host, and renders record by record, deriving its kernel constants from
+  what each record changed — the block-rate control path, measured against
+  the oracle's held render, with the envelopes themselves still on the
+  oracle's side and the host modelled as sending a record only where a
+  control moved.
 
 No MIDI, no ROM handling, no envelopes on the Falcon, and no oracle beyond
 the wave generator, the PCM partial, the reverb and the control ramps.

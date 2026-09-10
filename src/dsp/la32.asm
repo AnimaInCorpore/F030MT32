@@ -221,8 +221,11 @@ la_prev_c       ds      1               ; the previous block's cutoff >> 3, or -
 la_pow_guard    ds      9               ; zeros: a shift that clears the value
 la_pow          ds      24              ; 2^0 .. 2^22, then a zero for a shift of none
 
-; Control records land here from the host port: LA32_CONTROL_HEADER words
-; then three per block, below the X table alias at P:$4000.
+; A control run's payload lands here from the host port: the header in a
+; gap between the Y tables, the records - four words each, the frames a
+; record holds for and then its amp >> 10, pitch and cutoff >> 3 - in the
+; 1,024 words below the X table alias at P:$4000.
+LA32_CONTROL_HEADER_Y equ $1e00
 LA32_CONTROL_RECORDS equ $3c00
 
         ENDIF
@@ -1093,14 +1096,14 @@ la32_kernel_none:
 command_control:
         move    #>MT32_REPLY_BLOCK_READY,a
         jsr     send_reply
-        move    #>LA32_CONTROL_RECORDS,r0
+        move    #>LA32_CONTROL_HEADER_Y,r0
         move    #>-1,m0
         do      #LA32_CONTROL_HEADER,command_control_header
         jclr    #0,x:m_hsr,*
         movep   x:m_hrx,a
         move    a1,y:(r0)+
 command_control_header:
-        move    #>LA32_CONTROL_RECORDS,r1
+        move    #>LA32_CONTROL_HEADER_Y,r1
         move    #<la_step3,r2
         do      #LA32_CONFIG_WORDS,command_control_installed
         move    y:(r1)+,x0
@@ -1111,17 +1114,14 @@ command_control_installed:
         move    y:(r1)+,x0
         move    x0,y:>la_ras
         move    y:(r1)+,x0
-        move    x0,y:>la_blocklen
-        move    x0,a
-        move    #>1,x1
-        sub     x1,a
-        move    a1,y:<la_rest
+        move    x0,y:>la_blocklen       ; the nominal block length, unused
         move    y:(r1)+,a
         move    a1,y:<la_blocks
-        move    r1,y:>la_recbase
+        move    #>LA32_CONTROL_RECORDS,r0
+        move    r0,y:>la_recbase
         move    a1,b
         asl     b
-        add     a,b                     ; three words per block
+        asl     b                       ; four words per record
         move    b1,x0
         do      x0,command_control_records
         jclr    #0,x:m_hsr,*
@@ -1142,10 +1142,10 @@ command_control_records:
         move    #>-1,x0                 ; block 0 derives again inside the window
         move    x0,y:>la_prev_pitch
         move    x0,y:>la_prev_c
-        ; Per block: derive what the record changed. When the position
-        ; constants changed, render the first frame with the previous
-        ; block's, install, and render the rest, as Munt orders them;
-        ; otherwise render the block in one call.
+        ; Per record: derive what it changed. When the position constants
+        ; changed, render the first frame with the previous record's,
+        ; install, and render the rest, as Munt orders them; otherwise
+        ; render the record's frames in one call.
         do      y:<la_blocks,la32_control_done
 la32_control_loop:
         jsr     la32_block_derive
@@ -1165,8 +1165,6 @@ la32_control_loop:
         jsr     (r0)
         jmp     la32_control_next
 la32_control_steady:
-        move    y:>la_blocklen,x0
-        move    x0,y:<la_frames
         move    y:<la_entry,r0
         nop
         jsr     (r0)
@@ -1222,9 +1220,9 @@ la32_positions_perceptual:
         move    x0,y:<la_half1
         rts
 
-; Derive the kernel's block constants from one control record of amp >> 10,
-; pitch and cutoff >> 3, as LA32WaveGenerator does per sample, but only
-; what the record changed: the step when the pitch moved; the effective
+; Derive the kernel's block constants from one control record - the frames
+; it holds for, then amp >> 10, pitch and cutoff >> 3 - as
+; LA32WaveGenerator does per sample, but only what the record changed: the step when the pitch moved; the effective
 ; cutoff, the resonance wave-length factor, the segment lengths and the
 ; cutoff's two log terms when the cutoff moved; the amp's two words and the
 ; perceptual gain every block, since the amp moves in every envelope phase.
@@ -1237,6 +1235,11 @@ la32_positions_perceptual:
 la32_block_derive:
         move    y:>la_record,r2
         nop
+        move    y:(r2)+,a               ; the frames this record holds for
+        move    a1,y:<la_frames
+        move    #>1,x1
+        sub     x1,a
+        move    a1,y:<la_rest
         move    y:(r2)+,a               ; amp >> 10
         move    a1,y:<la_scr_ampt
         move    y:(r2)+,x0              ; pitch

@@ -15,9 +15,10 @@ listed at the bottom have started, and their numbers are the headline:
 > of every 15.62 ms period bit for bit and 3.89 ms perceptually, so the
 > host carries three PCM partials beside the DSP's six. The controls must
 > move every 16 frames, with the amp ramped inside the block, and deriving
-> a partial's constants from them costs the DSP 230 to 290 cycles per
-> block while its filter moves, 66 once it has settled — 15 and 4 per frame
-> at that rate.** All measured under the DSP-calibrated Hatari on
+> a partial's constants from them costs the DSP 240 to 290 cycles per
+> record while its filter moves — 15 to 18 per frame at that rate — and
+> nothing once it has settled, because the host sends a record only where
+> a control moved.** All measured under the DSP-calibrated Hatari on
 > 2026-09-09 and 2026-09-10 (`make profile-partials`, `make
 > profile-transport`, `make profile-pcms`, `make control-sweep`, `make
 > profile-controls`).
@@ -431,10 +432,10 @@ its attack. That is twice the rate the MT-32's own MCU uses for pitch and
 about the rate its envelopes need.
 
 The second is measured on the DSP (`make profile-control CFG=n NCODE=m`).
-The host hands the DSP a run's static constants and one record of amp >> 10,
-pitch and cutoff >> 3 per block — the three words a host running the
-envelopes would send — and the DSP derives the kernel's constants from each
-record before rendering the block: `la32_block_derive` reproduces
+The host hands the DSP a run's static constants and one record per block
+of the frames it holds for, amp >> 10, pitch and cutoff >> 3 — the words a
+host running the envelopes would send — and the DSP derives the kernel's
+constants from each record before rendering its frames: `la32_block_derive` reproduces
 `getSampleStep`, the effective cutoff, the resonance wave-length factor,
 the segment lengths and the two log bases from the same exponent table the
 unlog reads. It derives only what the record changed — the step when the
@@ -442,46 +443,54 @@ pitch moved, everything the cutoff feeds when the cutoff moved, the amp's
 two words and the perceptual gain always, since the amp moves in every
 envelope phase — with the data-dependent right shifts as multiplies by a
 power of two from a table and the block's kernel entered through a stored
-address. Every one of the 48 runs — six scenarios, both kernels, blocks of
-8, 16, 32 and 64 — matches the oracle's held render, the exact kernel word
-for word; one detail of Munt's order had to be copied for that, namely
-that a sample's pitch and cutoff reach the wave position one sample after
-its amp, so a block's position constants are installed after its first
-frame, and a block whose position constants did not change is rendered in
-one call. Per block, the exact kernel, at sixteen frames:
+address. Every one of the 60 runs — six scenarios, both kernels, blocks of
+8, 16, 32 and 64 and the adaptive stream below — matches the oracle's held
+render, the exact kernel word for word; one detail of Munt's order had to
+be copied for that, namely that a sample's pitch and cutoff reach the wave
+position one sample after its amp, so a record's position constants are
+installed after its first frame, and a record whose position constants
+did not change is rendered in one call. Per record, the exact kernel, at
+sixteen frames:
 
-| Per block, one partial | Filter moving (pluck, brass) | Vibrato only | Settled |
+| Per record, one partial | Filter moving (pluck, brass) | Vibrato only | Settled |
 | --- | ---: | ---: | ---: |
-| Derivation from the three words | 172 – 202 | 67 | 44 |
+| Derivation from the four words | 179 – 209 | 74 | 51 |
 | Installing the position constants | 20 | 14 | 0 |
-| Block loop, kernel entry and exit | 40 | 35 | 22 |
-| **Total** | **232 – 262** | **115** | **66** |
+| Record loop, kernel entry and exit | 40 | 34 | 19 |
+| **Total** | **239 – 269** | **121** | **71** |
 
-The perceptual kernel adds its gain, 24 cycles, to each column. The cost
-hardly depends on the block length, so per frame it is the block cost over
-the block length:
+The perceptual kernel adds its gain, 24 cycles, to each column. The first
+version of the derivation cost 303 cycles per block whatever the record
+did; deriving on change and trading the `rep` shifts for multiplies took
+the worst case down by a fifth and the settled note by three quarters.
+What the worst case keeps is the arithmetic of the cutoff: two exponent
+lookups with their shifts, the segment lengths, the two log terms, about
+130 cycles of it, and no note spends long there — a filter attack lasts
+tens of milliseconds, a sustain the rest of the note.
 
-| Block length | Filter moving, one partial | Settled | Six partials, filter moving | Six partials, settled |
-| --- | ---: | ---: | ---: | ---: |
-| 8 | 29 – 33 | 8 | 190 | 50 |
-| 16 | 15 – 16 | 4 | 95 | 25 |
-| 32 | 7 – 8 | 2 | 45 | 13 |
-| 64 | 4 | 1 | 23 | 6 |
+The rest of the saving is the host's. It looks at each partial every
+sixteen frames and sends a record only where one of the three words moved
+since the last one, with the frames the record holds for; the DSP renders
+those frames in one call and never derives anything for a partial whose
+controls stand still. Against fixed sixteen-frame blocks, per frame and
+partial, exact kernel:
 
-The first version of the derivation cost 303 cycles per block whatever the
-record did; deriving on change and trading the `rep` shifts for
-multiplies took the worst case down by a quarter and the settled note by
-four fifths. What the worst case keeps is the arithmetic of the cutoff:
-two exponent lookups with their shifts, the segment lengths, the two log
-terms, about 130 cycles of it, and no note spends long there — a filter
-attack lasts tens of milliseconds, a sustain the rest of the note. At the
-sixteen-frame rate six partials in their filter attacks cost about 95
-cycles per frame, close to two perceptual partials, and six settled ones
-25; "about 20" was the right guess for a note's sustain and wrong by a
-factor of five for its attack. A host that sends a record only when a
-control has moved would make the block length adaptive per partial,
-sixteen frames in an attack and 64 in a sustain, and take the settled cost
-to 6; that is not measured.
+| Scenario | Records sent, of 128 looks | Fixed blocks of 16 | Records on change |
+| --- | ---: | ---: | ---: |
+| pluck, filter attack and decay | 128 | 15.0 | 15.0 |
+| string, slow swell with vibrato | 128 | 15.6 | 15.6 |
+| brass, filter sweep with a wide LFO | 128 | 16.8 | 16.8 |
+| release, both controls settling | 23 | 5.7 | 2.1 |
+| sustain, everything settled | 1 | 4.4 | 0.13 |
+| vibrato over settled amp and cutoff | 90 | 7.6 | 6.3 |
+
+A moving control costs what it cost, and a filter attack or a swell moves
+every look; a settled note costs the kernel and nothing else. Six partials
+at the sixteen-frame rate therefore cost about 95 cycles per frame while
+their filters move, 40 under vibrato, and under one settled. "About 20"
+was the right guess for a note's sustain and wrong by a factor of five for
+its attack, and what a real note costs is the attack's share of its
+length.
 
 ## The arithmetic that follows
 
@@ -492,8 +501,8 @@ running; and nothing else running is not an option:
 | --- | ---: | --- |
 | Codec transport, receive by interrupt | 12 | measured, this page |
 | Boss reverb, room mode | 92 | measured, this page |
-| Per-block control, six partials at 16-frame blocks | 25 to 95 | measured, this page: settled notes to filter attacks |
-| **Left for partials** | **about 290 to 360** | |
+| Per-record control, six partials, records on change | 1 to 95 | measured, this page: settled notes to filter attacks |
+| **Left for partials** | **about 290 to 385** | |
 
 | Kernel | Square | Sawtooth |
 | --- | ---: | ---: |
@@ -501,17 +510,17 @@ running; and nothing else running is not an option:
 | exact, of 290 | 3.8 | 2.9 |
 | perceptual, of 489 | 9.2 | 7.6 |
 | perceptual, of 290 | 5.5 | 4.5 |
-| perceptual, of 360 | 6.8 | 5.6 |
+| perceptual, of 385 | 7.3 | 6.0 |
 
-That is **five perceptual partials while their filters move and six once
-they have settled, and three or four exact ones**, and the MT-32's
-factory timbres lean on sawtooth partials for most sustained sounds. The
-threshold this page named before any measurement, "more than about 60
-cycles per partial makes it a four-partial machine", is met by the exact
-kernel and only just escaped by the perceptual one; the reverb turned out
-half again as expensive as assumed, the transport as cheap as assumed, and
-the control as cheap as assumed in a sustain and four times as expensive
-in an attack.
+That is **five perceptual partials while their filters move and six or
+seven once they have settled, and three or four exact ones**, and the
+MT-32's factory timbres lean on sawtooth partials for most sustained
+sounds. The threshold this page named before any measurement, "more than
+about 60 cycles per partial makes it a four-partial machine", is met by
+the exact kernel and only just escaped by the perceptual one; the reverb
+turned out half again as expensive as assumed, the transport as cheap as
+assumed, and the control nothing in a sustain and four times the
+assumption in an attack.
 
 The host has its own budget, and it is smaller:
 
@@ -537,14 +546,14 @@ partial and three of them sound at most three such notes at once.
 The measurements change the order. Fewer partials is no longer a lever but
 the starting condition, and the partial itself is close to its floor.
 
-1. **Cheaper control.** Done in its second version: deriving only what
-   changed and replacing the `rep` shifts took a settled partial's block
-   from 303 cycles to 66 and a filter attack's to 230 – 260. What is left
-   is the host sending records only when a control moved, which makes the
-   block length adaptive per partial and would take six settled partials
-   from 25 cycles per frame to about 6; and about 40 cycles of the attack
-   path in long-addressed loads and two-word immediates that a tighter
-   register allocation could shave.
+1. **Cheaper control.** Done: deriving only what changed and replacing the
+   `rep` shifts took a filter attack's record from 303 cycles to 240 – 270,
+   and the host sending a record only where a control moved took a settled
+   partial from 4.4 cycles per frame to 0.13. What is left is about 40
+   cycles of the attack path in long-addressed loads and two-word
+   immediates that a tighter register allocation could shave, and the
+   per-frame amp ramp the design point asks for, which the kernels do not
+   do yet.
 2. **Move work between the halves.** The DSP is the busier chip in the
    planned configuration, at about 95 % with six partials and the reverb,
    and the host at about 90 % with three PCM partials and the transport,
@@ -616,9 +625,9 @@ done.
    it, and the program's own tick count repeats it on hardware.
 6. ~~**Find the control rate.**~~ Done: sixteen frames with the amp
    ramped inside the block, 32 when no filter attack is running; the
-   derivation costs 230 to 260 cycles per block and partial while the
-   filter moves and 66 once the note has settled. `make control-sweep`
-   and `make profile-controls` reproduce it.
+   derivation costs 240 to 270 cycles per record and partial while the
+   filter moves, and a settled partial, whose host sends no records, costs
+   nothing. `make control-sweep` and `make profile-controls` reproduce it.
 
 ## What would make the project not worth doing
 

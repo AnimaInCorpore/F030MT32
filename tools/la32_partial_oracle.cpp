@@ -44,7 +44,8 @@ static void usage() {
 		"         segments: lines 'a TARGET INCREMENT' and 'c TARGET INCREMENT', each ramp\n"
 		"         starting when the previous one of its kind raises its interrupt;\n"
 		"         MODE letters: A/P/C hold amp/pitch/cutoff per block, R ramps the amp\n"
-		"         linearly across the block, D dumps the per-sample controls instead\n");
+		"         linearly across the block, S holds the schedule given by lines\n"
+		"         'h FRAME AMPT PITCH CUTOFF3', D dumps the per-sample controls instead\n");
 	exit(2);
 }
 
@@ -62,14 +63,27 @@ static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, 
 		int panLeft, int panRight, unsigned frames, unsigned block, const char *mode,
 		unsigned basePitch, unsigned baseCutoff, int lfoDepth, unsigned lfoPeriod) {
 	std::vector<Segment> ampSegments, cutoffSegments;
+	// A schedule of held controls, the records a host sends only when a
+	// control moved: from each frame on, amp >> 10, pitch and cutoff >> 3.
+	struct Held {
+		unsigned start;
+		Bit32u ampt;
+		Bit16u pitch;
+		Bit32u cutoff3;
+	};
+	std::vector<Held> schedule;
 	char kind[8];
-	int target, increment;
-	while (scanf("%7s %d %d", kind, &target, &increment) == 3) {
-		const Segment segment = { Bit8u(target), Bit8u(increment) };
-		if (kind[0] == 'a') {
-			ampSegments.push_back(segment);
-		} else if (kind[0] == 'c') {
-			cutoffSegments.push_back(segment);
+	while (scanf("%7s", kind) == 1) {
+		if (kind[0] == 'a' || kind[0] == 'c') {
+			int target, increment;
+			if (scanf("%d %d", &target, &increment) != 2) usage();
+			const Segment segment = { Bit8u(target), Bit8u(increment) };
+			(kind[0] == 'a' ? ampSegments : cutoffSegments).push_back(segment);
+		} else if (kind[0] == 'h') {
+			unsigned start, ampt, pitchWord, cutoff3;
+			if (scanf("%u %u %u %u", &start, &ampt, &pitchWord, &cutoff3) != 4) usage();
+			const Held held = { start, ampt, Bit16u(pitchWord), cutoff3 };
+			schedule.push_back(held);
 		} else {
 			usage();
 		}
@@ -111,6 +125,8 @@ static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, 
 	const bool holdPitch = strchr(mode, 'P') != NULL;
 	const bool holdCutoff = strchr(mode, 'C') != NULL;
 	const bool rampAmp = strchr(mode, 'R') != NULL;
+	const bool scheduled = strchr(mode, 'S') != NULL;
+	if (scheduled && (schedule.empty() || schedule[0].start != 0)) usage();
 	if (strchr(mode, 'D') != NULL) {
 		// The words the host would send per block: amp >> 10, pitch, cutoff >> 3,
 		// the cutoff clamped as generateNextSample clamps it, which also keeps
@@ -130,12 +146,18 @@ static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, 
 	pair.init(false, false);
 	pair.initSynth(LA32PartialPair::MASTER, sawtooth, Bit8u(pulseWidth), Bit8u(resonance));
 	pair.deactivate(LA32PartialPair::SLAVE);
+	size_t held = 0;
 	for (unsigned i = 0; i < frames; i++) {
 		const unsigned start = i - i % block;
 		Bit32u a = amp[i];
 		Bit16u p = pitch[i];
 		Bit32u c = cutoff[i];
-		if (block > 1) {
+		if (scheduled) {
+			while (held + 1 < schedule.size() && schedule[held + 1].start <= i) held++;
+			a = schedule[held].ampt << 10;
+			p = schedule[held].pitch;
+			c = schedule[held].cutoff3 << 3;
+		} else if (block > 1) {
 			if (holdPitch) p = pitch[start];
 			if (holdCutoff) c = (cutoff[start] >> 3) << 3;
 			if (rampAmp) {
