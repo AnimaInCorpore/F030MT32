@@ -146,14 +146,16 @@ rv_outr3        ds      1               ; scratch: comb 3's last word
 ; beside ALU work. la32_tables_install copies the fixed words from P at boot;
 ; command_profile copies a configuration block over la_step3 onwards. The
 ; layout is mirrored by tools/la32_partial.py.
-; Block-derivation scratch, short-addressable beside the transport state.
+; Block-derivation scratch and the amp ramp's words, short-addressable
+; beside the transport state: the kernels read la_aslope, la_f and la_r in
+; parallel moves every frame.
         org     y:$9
 la_scr_ampt     ds      1               ; the record's amp >> 10
-la_scr_ecv      ds      1               ; effective cutoff value
-la_scr_rwlf4    ds      1               ; resonance wave length factor << 4
+la_aslope       ds      1               ; the record's amp slope per frame, log units
+la_f            ds      1               ; perceptual amp ramp: the sum's factor, Q23
 la_scr_hl4      ds      1               ; high linear length >> 4
 la_scr_ll4      ds      1               ; low linear length >> 4
-la_cut_amp      ds      1               ; the cutoff's square amp term, 0 above the middle
+la_r            ds      1               ; perceptual amp ramp: F's factor per frame, Q22
 la_cut_res      ds      1               ; ras + the cutoff's resonance term - 4096
 
         org     y:$10
@@ -218,15 +220,26 @@ la_pend_k7      ds      1
 la_pend_b3      ds      1
 la_prev_pitch   ds      1               ; the previous block's pitch, or -1
 la_prev_c       ds      1               ; the previous block's cutoff >> 3, or -1
+la_scr_ecv      ds      1               ; effective cutoff value
+la_scr_rwlf4    ds      1               ; resonance wave length factor << 4
+la_cut_amp      ds      1               ; the cutoff's square amp term, 0 above the middle
 la_pow_guard    ds      9               ; zeros: a shift that clears the value
 la_pow          ds      24              ; 2^0 .. 2^22, then a zero for a shift of none
 
 ; A control run's payload lands here from the host port: the header in a
-; gap between the Y tables, the records - four words each, the frames a
-; record holds for and then its amp >> 10, pitch and cutoff >> 3 - in the
-; 1,024 words below the X table alias at P:$4000.
+; gap between the Y tables, the records - five words each, the frames a
+; record holds for, then its amp >> 10, the amp's slope per frame, pitch
+; and cutoff >> 3 - in the free X memory past the exact power table.
 LA32_CONTROL_HEADER_Y equ $1e00
-LA32_CONTROL_RECORDS equ $3c00
+LA32_CONTROL_RECORDS equ $3900
+
+; The perceptual amp ramp's factor per frame, Q22, from the image
+; tools/la32_partial.py emits below the X table alias: 2^(s/4096) for a
+; rising amp at slope -s, then 2^(-s/4096) for a falling one, s below
+; LA32_RAMP_STEEP; steeper slopes come from the exponent table.
+LA32_RAMP_RISING    equ     $3c00
+LA32_RAMP_FALLING   equ     $3e00
+LA32_RAMP_STEEP     equ     512
 
         ENDIF
 
@@ -474,16 +487,18 @@ la32_square_loop:
         tfr     y1,b    y:<la_m7fe0,x1
         and     x1,b    y:<la_rtab,a     ; b1 = R4 & $7fe0; a1 = table base
         move    b1,x1
-        mac     x1,y0,a                  ; a1 = base + ((R4 >> 5) & 1023)
+        mac     x1,y0,a y:<la_aslope,x1  ; a1 = base + ((R4 >> 5) & 1023); x1 = amp slope
         move    a1,r0
-; square log sample
+; square log sample, the amp term ramped by the slope for this frame
         move    l:(r2+n2),b              ; b1 = sine<<2 or 0, b0 = window term
         move    y:<la_ampt,a
-        add     b,a     y:(r1)+,y1       ; a1 = square log; y1 = decay << 15
+        add     x1,a    y:(r1)+,y1       ; a1 = amp term; y1 = decay << 15
+        add     b,a     a1,y:<la_ampt    ; a1 = square log; the term stays ramped
         move    a1,y:<la_sqlog
-; resonance log sample
+; resonance log sample, its base ramped likewise
         move    y:<la_rbase,a
-        mac     x0,y1,a y:(r0),y0        ; a1 = rbase + (R4 * decay) >> 8; y0 = sine<<2
+        add     x1,a    y:(r0),y0        ; a1 = base; y0 = sine<<2
+        mac     x0,y1,a a1,y:<la_rbase   ; a1 = base + (R4 * decay) >> 8
         add     y0,a
         move    b0,x1
         add     x1,a    y:(r1),y1        ; a1 = resonance log; y1 = square sign
@@ -561,14 +576,16 @@ la32_saw_loop:
         tfr     y1,b    y:<la_m7fe0,x1
         and     x1,b    y:<la_rtab,a
         move    b1,x1
-        mac     x1,y0,a
+        mac     x1,y0,a y:<la_aslope,x1
         move    a1,r0
         move    l:(r2+n2),b
         move    y:<la_ampt,a
-        add     b,a     y:(r1)+,y1
+        add     x1,a    y:(r1)+,y1
+        add     b,a     a1,y:<la_ampt
         move    a1,y:<la_sqlog
         move    y:<la_rbase,a
-        mac     x0,y1,a y:(r0),y0
+        add     x1,a    y:(r0),y0
+        mac     x0,y1,a a1,y:<la_rbase
         add     y0,a
         move    b0,x1
         add     x1,a    y:(r1),y1        ; a1 = resonance log; y1 = square sign
@@ -692,7 +709,13 @@ la32_psquare_loop:
         move    a1,r1
         move    y:<la_panl,y0
         move    y:(r1),x0                ; x0 = gain, Q21
-        mac     x0,x1,b                  ; b1 = sample
+        mac     x0,x1,b y:<la_f,y1       ; b1 = sample; y1 = F
+; the amp ramp: scale by F, then F *= r for the next frame
+        move    b1,x0
+        mpyr    x0,y1,b y:<la_r,x1       ; b1 = the sample scaled by F; x1 = r
+        mpy     y1,x1,a                  ; a1 = F * r, Q22
+        asl     a
+        move    a,y:<la_f                ; Q23, limited at one
 ; pan into the interleaved accumulation buffer; reload the step for the next frame
         move    b1,x0
         move    x:(r6),a
@@ -763,7 +786,13 @@ la32_psaw_loop:
         move    a1,r0
         move    b1,x0                    ; x0 = sum
         move    x:(r0),y1                ; y1 = signed cosine * 1024
-        mpy     x0,y1,b y:<la_panl,y0    ; b1 = sum * cosine / 8192
+        mpy     x0,y1,b y:<la_f,y1       ; b1 = sum * cosine / 8192; y1 = F
+; the amp ramp: scale by F, then F *= r for the next frame
+        move    b1,x0
+        mpyr    x0,y1,b y:<la_r,x1       ; b1 = the sample scaled by F; x1 = r
+        mpy     y1,x1,a y:<la_panl,y0    ; a1 = F * r, Q22; y0 = left pan
+        asl     a
+        move    a,y:<la_f                ; Q23, limited at one
         move    b1,x0
         move    x:(r6),a
         mac     x0,y0,a y:<la_panr,y1
@@ -1023,6 +1052,12 @@ command_profile:
         jsr     profile_install
         move    #>LA32_PROFILE_FRAMES,x0
         move    x0,y:<la_frames
+        move    #>0,x0
+        move    x0,y:<la_aslope         ; the amp stands for the whole run
+        move    #>$7fffff,x0
+        move    x0,y:<la_f
+        move    #>$400000,x0
+        move    x0,y:<la_r
         jsr     profile_prepare
         jsr     la32_kernel_run
         jsr     profile_fold
@@ -1121,13 +1156,15 @@ command_control_installed:
         move    r0,y:>la_recbase
         move    a1,b
         asl     b
-        asl     b                       ; four words per record
+        asl     b
+        add     a,b                     ; five words per record
         move    b1,x0
         do      x0,command_control_records
         jclr    #0,x:m_hsr,*
         movep   x:m_hrx,a
-        move    a1,y:(r0)+
+        move    a1,x:(r0)+
 command_control_records:
+        move    #>-1,m2                 ; the derivation walks the records with r2
         jsr     la32_kernel_entry
         move    #>-1,x0
         move    x0,y:>la_prev_pitch
@@ -1158,8 +1195,10 @@ la32_control_loop:
         nop
         jsr     (r0)
         jsr     la32_block_positions
-        move    y:<la_rest,x0
-        move    x0,y:<la_frames
+        move    y:<la_rest,a
+        tst     a
+        jeq     la32_control_next       ; a record of one frame is done
+        move    a1,y:<la_frames
         move    y:<la_entry,r0
         nop
         jsr     (r0)
@@ -1221,7 +1260,8 @@ la32_positions_perceptual:
         rts
 
 ; Derive the kernel's block constants from one control record - the frames
-; it holds for, then amp >> 10, pitch and cutoff >> 3 - as
+; it holds for, then amp >> 10, the amp's slope per frame, pitch and
+; cutoff >> 3 - as
 ; LA32WaveGenerator does per sample, but only what the record changed: the step when the pitch moved; the effective
 ; cutoff, the resonance wave-length factor, the segment lengths and the
 ; cutoff's two log terms when the cutoff moved; the amp's two words and the
@@ -1235,15 +1275,17 @@ la32_positions_perceptual:
 la32_block_derive:
         move    y:>la_record,r2
         nop
-        move    y:(r2)+,a               ; the frames this record holds for
+        move    x:(r2)+,a               ; the frames this record holds for
         move    a1,y:<la_frames
         move    #>1,x1
         sub     x1,a
         move    a1,y:<la_rest
-        move    y:(r2)+,a               ; amp >> 10
+        move    x:(r2)+,a               ; amp >> 10
         move    a1,y:<la_scr_ampt
-        move    y:(r2)+,x0              ; pitch
-        move    y:(r2)+,b               ; cutoff >> 3
+        move    x:(r2)+,a               ; the amp's slope per frame
+        move    a1,y:<la_aslope
+        move    x:(r2)+,x0              ; pitch
+        move    x:(r2)+,b               ; cutoff >> 3
         move    r2,y:>la_record
         move    #>0,x1
         move    x1,y:<la_poschg
@@ -1292,7 +1334,7 @@ la32_derive_pitch_same:
         move    a1,x1
         move    #>$10000,y0             ; 2^16: a right shift by 7
         mpy     x1,y0,a
-        move    a1,y:<la_scr_ecv
+        move    a1,y:>la_scr_ecv
 ; resonance wave-length factor << 4 = (interpolateExp << 8 >> 5) << (ecv >> 12 + 1)
         move    y:<la_m4095,x1
         tfr     a,b
@@ -1310,7 +1352,7 @@ la32_derive_pitch_same:
         mpy     y0,x0,a
         rep     x1
         asl     a
-        move    a1,y:<la_scr_rwlf4
+        move    a1,y:>la_scr_rwlf4
 ; (rwlf >> 4) << 7 = (rwlf4 >> 1) & ~127, shifted in the accumulator: at the
 ; cutoff ceiling rwlf4 reaches 2^23, one bit more than a data register holds
         asr     a
@@ -1319,7 +1361,7 @@ la32_derive_pitch_same:
         move    a1,y:>la_pend_k7
 ; high linear length >> 4 = (interpolateExp << 8 >> 6) << (arg >> 12 + 1) - 2^15
 ; while the pulse-width term is below the effective cutoff, else 0
-        move    y:<la_scr_ecv,a
+        move    y:>la_scr_ecv,a
         move    y:>la_epw,x1
         cmp     x1,a
         jle     la32_derive_no_high
@@ -1353,7 +1395,7 @@ la32_derive_high_done:
         move    #>$8000,x1
         add     x1,a
         move    a1,y:>la_pend_b3
-        move    y:<la_scr_rwlf4,a
+        move    y:>la_scr_rwlf4,a
         move    #>$10000,x1
         sub     x1,a
         move    y:<la_scr_hl4,x1
@@ -1368,14 +1410,14 @@ la32_derive_high_done:
         move    #>$20000,y0             ; 2^17: a right shift by 6
         mpy     x1,y0,b
         move    b1,x1
-        move    x1,y:<la_cut_amp
+        move    x1,y:>la_cut_amp
         move    x1,b
         move    #>31743,y1
         add     y1,b                    ; the resonance's cutoff term
         jmp     la32_derive_cutoff_done
 la32_derive_cutoff_high:
         move    #>0,x1
-        move    x1,y:<la_cut_amp
+        move    x1,y:>la_cut_amp
         move    y:>la_prev_c,x1
         move    #>$480000,b             ; 144 << 15: the decay threshold
         cmp     x1,b
@@ -1403,42 +1445,142 @@ la32_derive_cutoff_done:
         sub     x1,a
         move    a1,y:<la_cut_res
 la32_derive_cutoff_same:
-; the amp's words, every block
+; the amp's words, every record
+        move    y:<la_kernel,b
+        tst     b
+        jne     la32_derive_amp_perceptual
+; exact kernels: la_ampt and la_rbase one slope before the record's first
+; frame; the kernels add the slope each frame before they use them
         move    y:<la_scr_ampt,a
+        move    y:<la_aslope,x1
+        sub     x1,a
+        move    a1,y1
         move    y:<la_cut_res,x1
         add     x1,a
         move    a1,y:<la_rbase
-        move    y:<la_scr_ampt,a
-        move    y:<la_cut_amp,x1
+        move    y1,a
+        move    y:>la_cut_amp,x1
         add     x1,a
         move    a1,y:<la_ampt
-        move    y:<la_kernel,b
-        tst     b
-        jeq     la32_derive_done
-; the perceptual gain = (interpolateExp(ampt & 4095) << 8) >> (ampt >> 12)
-        move    y:<la_m4095,x1
-        tfr     a,b
-        and     x1,b
+        rts
+; perceptual kernels: the gain and the resonance base at the record's
+; louder end, and the sum scaled by F, which the kernel multiplies by r
+; each frame - r = 2^(-slope/4096) from F = 1 when the amp falls or
+; stands, r = 2^(|slope|/4096) from F = 2^(slope * frames / 4096) when it
+; rises, so F reaches 1 on the record's last frame
+la32_derive_amp_perceptual:
+        move    y:<la_aslope,a
+        tst     a
+        jlt     la32_derive_amp_rising
+        move    #>LA32_RAMP_STEEP,x1
+        cmp     x1,a
+        jge     la32_derive_amp_falling_steep
+        move    #>LA32_RAMP_FALLING,x1  ; r = 2^(-slope/4096) from the table
+        add     x1,a
+        move    a1,r0
+        nop
+        move    y:(r0),x1
+        move    x1,y:<la_r
+        jmp     la32_derive_amp_falling
+la32_derive_amp_falling_steep:
+        move    a1,x1
+        jsr     la32_derive_pow2        ; a1 = 2^(-slope/4096) * 2^21
+        jsr     la32_derive_unbias
+        asl     a                       ; Q22
+        move    a1,y:<la_r
+la32_derive_amp_falling:
+        move    #>$7fffff,x1
+        move    x1,y:<la_f
+        move    y:<la_scr_ampt,y1       ; the basis: the record's first frame
+        jmp     la32_derive_amp_basis
+la32_derive_amp_rising:
+        neg     a
+        move    a1,x0                   ; x0 = |slope|
+        move    y:<la_frames,y0
+        mpy     x0,y0,b                 ; b = 2 * |slope| * frames
+        asr     b
+        move    b0,x1                   ; x1 = |slope| * frames
+        move    y:<la_scr_ampt,b
+        sub     x1,b
+        move    #>0,y1
+        tmi     y1,b                    ; a truncated slope never lands below zero
+        move    b1,y1                   ; the basis: the record's last frame
+        jsr     la32_derive_pow2        ; a1 = 2^(-|slope| * frames / 4096) * 2^21
+        jsr     la32_derive_unbias
+        asl     a
+        asl     a                       ; Q23
+        move    a1,y:<la_f
+        move    #>LA32_RAMP_STEEP,x1
+        move    x0,b
+        cmp     x1,b
+        jge     la32_derive_amp_rising_steep
+        move    #>LA32_RAMP_RISING,x1   ; r = 2^(|slope|/4096) from the table
+        add     x1,b
         move    b1,r0
+        nop
+        move    y:(r0),x1
+        move    x1,y:<la_r
+        jmp     la32_derive_amp_basis
+la32_derive_amp_rising_steep:
+        move    #>4096,b
+        sub     x0,b                    ; b1 = 4096 - |slope|
+        move    #>0,x1
+        tmi     x1,b
+        move    b1,x1
+        jsr     la32_derive_pow2        ; a1 = 2^(|slope|/4096) * 2^20
+        jsr     la32_derive_unbias
+        asl     a
+        asl     a                       ; Q22
+        move    a,y:<la_r               ; limited at two
+la32_derive_amp_basis:
+        move    y1,a
+        move    y:<la_cut_res,x1
+        add     x1,a
+        move    a1,y:<la_rbase
+        move    y1,a
+        move    y:>la_cut_amp,x1
+        add     x1,a
+        move    a1,y:<la_ampt
+; the perceptual gain = 2^(-ampt/4096) * 2^21 from the amp term, signed per half
         move    a1,x1
-        move    y:<la_sh12,y0
-        mpy     x1,y0,a                 ; the shift, 0 to 32
-        move    a1,x1
-        move    #>la_pow+23,a
-        sub     x1,a
-        move    a1,r1                   ; 2^(23 - shift), zero beyond the table
-        move    x:(r0),y0
-        move    y:(r1),x0
-        mpy     x0,y0,a                 ; the gain, except for a shift of none
-        move    x1,b
-        tst     b
-        teq     y0,a                    ; a shift of none keeps the table value
+        jsr     la32_derive_pow2
         move    a1,x1
         move    x1,y:<la_half0+3
         move    x1,a
         neg     a
         move    a1,y:<la_half1+3
-la32_derive_done:
+        rts
+
+; 2^(-x1/4096) as a Q21 value in a1, from the exact unlog table:
+; interpolateExp(x1 & 4095) << 8 >> (x1 >> 12), the shift a multiply by a
+; power of two from la_pow. Scratches a, b, x1, y0, r0 and r1.
+la32_derive_pow2:
+        move    x1,a
+        move    y:<la_m4095,y0
+        and     y0,a
+        move    a1,r0                   ; the fraction's table index
+        move    y:<la_sh12,y0
+        mpy     x1,y0,a                 ; the shift, 0 to 32
+        move    a1,b
+        move    #>la_pow+23,a
+        sub     b,a
+        move    a1,r1                   ; 2^(23 - shift), zero beyond the table
+        move    x:(r0),y0
+        move    y:(r1),x1
+        mpy     x1,y0,a                 ; the value, except for a shift of none
+        tst     b
+        teq     y0,a                    ; a shift of none keeps the table value
+        rts
+
+; Munt's exponent table starts at 8191 of 8192, a bias the ramp's factors
+; would compound frame after frame: a = a1 + (a1 >> 13), clean below a1.
+la32_derive_unbias:
+        move    a1,x1
+        move    #>$000400,y0            ; 2^10: a right shift by 13
+        mpy     x1,y0,a
+        move    a1,y0
+        move    x1,a
+        add     y0,a
         rts
 
 ; Copy the fixed constants into internal Y and the first page of the unlog

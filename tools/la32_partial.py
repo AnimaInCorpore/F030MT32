@@ -56,6 +56,8 @@ GAIN_Y = 0x0900           # perceptual: 2^(-(16j+8)/4096)*2^21 for j = -guard..4
 GAIN_GUARD = 192
 RESONANCE_Y = 0x1A00      # exact: sine<<2 (log), reversed upper half, 1024
 SINE_Y = 0x2C00           # perceptual: +/-linear sine*4, 2048, twice
+RAMP_Y = 0x3C00           # perceptual amp ramp factors, Q22: 512 rising, 512 falling
+RAMP_STEEP = 512
 CONST_IMAGE_P = 0x0700
 CONFIG_IMAGE_P = 0x0740
 CONFIG_WORDS = 18
@@ -486,6 +488,13 @@ def emit_tables(tables: Tables) -> str:
                      f"Y:${SQUARE_PERC:04x} the same window beside the linear values", window)
     lines += section(SINE_Y, "la32_sine_image",
                      f"Y:${SINE_Y:04x} perceptual signed linear sine * 4, sign in bit 10, twice", signed_sine + signed_sine)
+    # The perceptual amp ramp multiplies the sum's factor by 2^(-slope/4096)
+    # each frame: the factor for a rising amp (negative slope) first, then
+    # for a falling one, Q22, exact to the rounding.
+    ramp = [int(round(2.0 ** (s / 4096.0) * (1 << 22))) for s in range(RAMP_STEEP)]
+    ramp += [int(round(2.0 ** (-s / 4096.0) * (1 << 22))) for s in range(RAMP_STEEP)]
+    lines += section(RAMP_Y, "la32_ramp_image",
+                     f"Y:${RAMP_Y:04x} perceptual amp ramp factors 2^(s/4096) then 2^(-s/4096), Q22", ramp)
     lines += section(UNLOG_X + X_ALIAS, "la32_unlog_image",
                      f"X:${UNLOG_X:04x} exact interpolateExp(frac) << 8", unlog)
     lines += section(SQUARE_EXACT + X_ALIAS, "la32_square_value_image",

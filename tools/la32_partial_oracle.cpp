@@ -44,8 +44,9 @@ static void usage() {
 		"         segments: lines 'a TARGET INCREMENT' and 'c TARGET INCREMENT', each ramp\n"
 		"         starting when the previous one of its kind raises its interrupt;\n"
 		"         MODE letters: A/P/C hold amp/pitch/cutoff per block, R ramps the amp\n"
-		"         linearly across the block, S holds the schedule given by lines\n"
-		"         'h FRAME AMPT PITCH CUTOFF3', D dumps the per-sample controls instead\n");
+		"         linearly across the block, S follows the schedule given by lines\n"
+		"         'h FRAME AMPT SLOPE PITCH CUTOFF3', the amp term ramped by SLOPE per\n"
+		"         frame, D dumps the per-sample controls and ramp segments instead\n");
 	exit(2);
 }
 
@@ -67,7 +68,8 @@ static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, 
 	// control moved: from each frame on, amp >> 10, pitch and cutoff >> 3.
 	struct Held {
 		unsigned start;
-		Bit32u ampt;
+		Bit32s ampt;
+		Bit32s slope;
 		Bit16u pitch;
 		Bit32u cutoff3;
 	};
@@ -80,9 +82,10 @@ static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, 
 			const Segment segment = { Bit8u(target), Bit8u(increment) };
 			(kind[0] == 'a' ? ampSegments : cutoffSegments).push_back(segment);
 		} else if (kind[0] == 'h') {
-			unsigned start, ampt, pitchWord, cutoff3;
-			if (scanf("%u %u %u %u", &start, &ampt, &pitchWord, &cutoff3) != 4) usage();
-			const Held held = { start, ampt, Bit16u(pitchWord), cutoff3 };
+			unsigned start, pitchWord, cutoff3;
+			int ampt, slope;
+			if (scanf("%u %d %d %u %u", &start, &ampt, &slope, &pitchWord, &cutoff3) != 5) usage();
+			const Held held = { start, ampt, slope, Bit16u(pitchWord), cutoff3 };
 			schedule.push_back(held);
 		} else {
 			usage();
@@ -102,12 +105,15 @@ static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, 
 	const unsigned total = frames + block;
 	std::vector<Bit32u> amp(total), cutoff(total);
 	std::vector<Bit16u> pitch(total);
+	std::vector<unsigned> ampSegment(total), cutoffSegment(total);
 	for (unsigned i = 0; i < total; i++) {
 		amp[i] = 67117056 - ampRamp.nextValue();
+		ampSegment[i] = unsigned(ampIndex);
 		if (ampRamp.checkInterrupt() && ++ampIndex < ampSegments.size()) {
 			ampRamp.startRamp(ampSegments[ampIndex].target, ampSegments[ampIndex].increment);
 		}
 		cutoff[i] = (baseCutoff << 18) + cutoffRamp.nextValue();
+		cutoffSegment[i] = unsigned(cutoffIndex);
 		if (cutoffRamp.checkInterrupt() && ++cutoffIndex < cutoffSegments.size()) {
 			cutoffRamp.startRamp(cutoffSegments[cutoffIndex].target, cutoffSegments[cutoffIndex].increment);
 		}
@@ -131,11 +137,14 @@ static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, 
 		// The words the host would send per block: amp >> 10, pitch, cutoff >> 3,
 		// the cutoff clamped as generateNextSample clamps it, which also keeps
 		// the word inside the DSP's signed 24 bits when the base and the
-		// modifier add up past 256 levels.
+		// modifier add up past 256 levels; then the amp and cutoff ramp
+		// segments in force, so a host model can align its records to their
+		// starts.
 		const Bit32u maxCutoff = 240 << 18;
 		for (unsigned i = 0; i < frames; i++) {
 			const Bit32u c = cutoff[i] < maxCutoff ? cutoff[i] : maxCutoff;
-			printf("%u %u %u\n", unsigned(amp[i] >> 10), unsigned(pitch[i]), unsigned(c >> 3));
+			printf("%u %u %u %u %u\n", unsigned(amp[i] >> 10), unsigned(pitch[i]), unsigned(c >> 3),
+				ampSegment[i], cutoffSegment[i]);
 		}
 		return 0;
 	}
@@ -153,10 +162,13 @@ static int runControl(const Tables &tables, bool sawtooth, unsigned pulseWidth, 
 		Bit16u p = pitch[i];
 		Bit32u c = cutoff[i];
 		if (scheduled) {
+			// The record in force, its amp term ramped by its slope per frame,
+			// which is what the DSP's kernels add each frame.
 			while (held + 1 < schedule.size() && schedule[held + 1].start <= i) held++;
-			a = schedule[held].ampt << 10;
-			p = schedule[held].pitch;
-			c = schedule[held].cutoff3 << 3;
+			const Held &record = schedule[held];
+			a = Bit32u(record.ampt + record.slope * Bit32s(i - record.start)) << 10;
+			p = record.pitch;
+			c = record.cutoff3 << 3;
 		} else if (block > 1) {
 			if (holdPitch) p = pitch[start];
 			if (holdCutoff) c = (cutoff[start] >> 3) << 3;

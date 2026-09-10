@@ -61,8 +61,10 @@ SWEEP_MODES = [
     ("C", "hold the cutoff only"),
 ]
 MARKER = 0x01C300
-RECORD_WORDS = 4                          # frames held, amp >> 10, pitch, cutoff >> 3
+RECORD_WORDS = 5                          # frames held, amp >> 10, amp slope per frame, pitch, cutoff >> 3
 HEADER_WORDS = CONFIG_WORDS + 2 + 2       # constants, epw and ras, nominal block length and record count
+LOOKAHEAD = 64                            # control rows past the run, for the last record's slope
+RECORD_AREA = 1792                        # words of DSP memory the records may fill
 FASTEST = 127
 IMMEDIATE = 0x80 | 127                     # descending at the top rate: lands at once
 
@@ -138,29 +140,69 @@ RUNS = [ControlRun(scenario, kernel) for kernel in KERNELS for scenario in SCENA
 def segments_text(scenario: Scenario, schedule: list | None = None) -> str:
     lines = [f"a {t} {i}" for t, i in scenario.amp] + [f"c {t} {i}" for t, i in scenario.cutoff]
     if schedule:
-        lines += [f"h {start} {ampt} {pitch} {cutoff3}" for start, ampt, pitch, cutoff3 in schedule]
+        lines += [f"h {start} {ampt} {slope} {pitch} {cutoff3}"
+                  for start, ampt, slope, pitch, cutoff3 in schedule]
     return "\n".join(lines) + "\n"
 
 
-def records(controls: list[list[int]], ncode: int) -> list[tuple[int, int, int, int]]:
-    """The records the host sends: (start frame, amp >> 10, pitch, cutoff >> 3).
+def slope_between(controls: list[list[int]], start: int, end: int) -> int:
+    """The amp term's change per frame from start to end, truncated toward
+    zero, so a ramp never runs past the value it aims at."""
+    return int((controls[end][0] - controls[start][0]) / (end - start))
 
-    A fixed block length sends one every N frames. The adaptive stream is
-    what a host that looks at each partial every CONTROL_RATE frames sends:
-    a record only when one of the three words moved since the last one, so
-    an attack costs a record per look and a sustain costs none.
+
+def records(controls: list[list[int]], ncode: int) -> list[tuple[int, int, int, int, int]]:
+    """The records the host sends: (start frame, amp >> 10, amp slope per
+    frame, pitch, cutoff >> 3).
+
+    A fixed block length sends one every N frames, each with the slope that
+    reaches the next block's amp term. The adaptive stream is what a host
+    running the envelopes sends: it looks at each partial every CONTROL_RATE
+    frames, at every start of a ramp segment and at every corner where a
+    ramp reaches its target, and sends a record when the pitch or the cutoff
+    word moved, at a segment start or a corner, or when the amp term left
+    the line the last record's slope predicts - so a straight ramp at an
+    integer step costs one record, an attack at a fractional step one per
+    look, and a sustain none.
     """
     block = BLOCK_LENGTHS[ncode]
     if block != "adaptive":
-        return [(t, *controls[t]) for t in range(0, FRAMES, block)]
+        return [(t, controls[t][0], slope_between(controls, t, t + block), controls[t][1], controls[t][2])
+                for t in range(0, FRAMES, block)]
+    # A record boundary at every start of a ramp segment, and at every
+    # corner where a ramp's step changes - the partial last step into its
+    # target and the flat frame after it - so no record's straight line runs
+    # over a bend; a step that only wavers by one is a fractional ramp.
+    starts = {t for t in range(1, FRAMES) if controls[t][3:] != controls[t - 1][3:]}
+    corners = set()
+    for column in (0, 2):
+        for t in range(1, FRAMES - 1):
+            before = controls[t][column] - controls[t - 1][column]
+            after = controls[t + 1][column] - controls[t][column]
+            if abs(after - before) > 1:
+                corners.add(t)
+    looks = sorted(set(range(0, FRAMES, CONTROL_RATE)) | starts | corners)
     out = []
-    for t in range(0, FRAMES, CONTROL_RATE):
-        if not out or list(out[-1][1:]) != controls[t]:
-            out.append((t, *controls[t]))
+    i = 0
+    while i < len(looks):
+        t = looks[i]
+        ampt, pitch, cutoff3 = controls[t][:3]
+        following = looks[i + 1] if i + 1 < len(looks) else FRAMES
+        slope = slope_between(controls, t, following)
+        j = i + 1
+        while j < len(looks):
+            u = looks[j]
+            if u in starts or controls[u][1] != pitch or controls[u][2] != cutoff3:
+                break
+            if controls[u][0] != ampt + slope * (u - t):
+                break
+            j += 1
+        out.append((t, ampt, slope, pitch, cutoff3))
+        i = j
     return out
 
 
-def record_lengths(schedule: list[tuple[int, int, int, int]]) -> list[int]:
+def record_lengths(schedule: list[tuple]) -> list[int]:
     starts = [start for start, *_ in schedule] + [FRAMES]
     return [b - a for a, b in zip(starts, starts[1:])]
 
@@ -170,27 +212,38 @@ def block_name(ncode: int) -> str:
     return "adaptive" if block == "adaptive" else f"N{block}"
 
 
-def oracle_args(scenario: Scenario, block: int, mode: str, pan_left: int, pan_right: int) -> list[str]:
+def oracle_args(scenario: Scenario, block: int, mode: str, pan_left: int, pan_right: int,
+                frames: int = FRAMES) -> list[str]:
     return [
         "control", str(int(scenario.sawtooth)), str(scenario.pulse_width), str(scenario.resonance),
-        str(pan_left), str(pan_right), str(FRAMES), str(block), mode,
+        str(pan_left), str(pan_right), str(frames), str(block), mode,
         str(scenario.base_pitch), str(scenario.base_cutoff), str(scenario.lfo_depth), str(scenario.lfo_period),
     ]
 
 
-def run_oracle(oracle: Path, scenario: Scenario, block: int, mode: str, pan_left: int, pan_right: int) -> list[list[int]]:
+def run_oracle(oracle: Path, scenario: Scenario, block: int, mode: str, pan_left: int, pan_right: int,
+               frames: int = FRAMES, schedule: list | None = None) -> list[list[int]]:
     # An absolute path: a native Windows Python does not search a relative
     # one with forward slashes.
     result = subprocess.run(
-        [str(Path(oracle).resolve())] + oracle_args(scenario, block, mode, pan_left, pan_right),
-        input=segments_text(scenario), capture_output=True, text=True, check=True,
+        [str(Path(oracle).resolve())] + oracle_args(scenario, block, mode, pan_left, pan_right, frames),
+        input=segments_text(scenario, schedule), capture_output=True, text=True, check=True,
     )
     return [[int(v) for v in line.split()] for line in result.stdout.splitlines() if line.strip()]
 
 
+def controls_of(oracle: Path, scenario: Scenario) -> list[list[int]]:
+    """The per-sample control words and ramp segments, with the lookahead."""
+    left, right = pans(scenario)
+    rows = run_oracle(oracle, scenario, 1, "D", left, right, FRAMES + LOOKAHEAD)
+    if len(rows) != FRAMES + LOOKAHEAD:
+        raise SystemExit(f"error: the oracle dumped {len(rows)} control rows for {scenario.name}")
+    return rows
+
+
 def scenario_config(scenario: Scenario, controls: list[list[int]]) -> Config:
     """A Config carrying the first frame's controls: the static words come from it."""
-    ampt, pitch, cutoff3 = controls[0]
+    ampt, pitch, cutoff3 = controls[0][:3]
     return Config(scenario.name, scenario.sawtooth, scenario.pulse_width, scenario.resonance,
                   ampt << 10, pitch, cutoff3 << 3, scenario.pan)
 
@@ -206,10 +259,10 @@ def payload(tables: Tables, run: ControlRun, controls: list[list[int]], ncode: i
     schedule = records(controls, ncode)
     block = BLOCK_LENGTHS[ncode]
     words += [run.scenario.epw, run.scenario.ras, CONTROL_RATE if block == "adaptive" else block, len(schedule)]
-    for (start, ampt, pitch, cutoff3), length in zip(schedule, record_lengths(schedule)):
-        words += [length, ampt, pitch, cutoff3]
+    for (start, ampt, slope, pitch, cutoff3), length in zip(schedule, record_lengths(schedule)):
+        words += [length, ampt, slope & WORD_MASK, pitch, cutoff3]
     assert len(words) == HEADER_WORDS + RECORD_WORDS * len(schedule)
-    if RECORD_WORDS * len(schedule) > 1024:
+    if RECORD_WORDS * len(schedule) > RECORD_AREA:
         raise SystemExit(f"error: {run.name}: {len(schedule)} records overflow the DSP's record area")
     for word in words:
         if not 0 <= word <= WORD_MASK:
@@ -223,19 +276,17 @@ def emit_tables(tables: Tables, oracle: Path) -> str:
         ";",
         "; Payloads for MT32_CMD_CONTROL_RUN, one per run and block-length code:",
         "; the kernel's static constants, the pulse-width and resonance terms",
-        "; the per-block derivation needs, the nominal block length and the",
+        "; the per-record derivation needs, the nominal block length and the",
         "; record count, then one record per block of the frames it holds for,",
-        "; amp >> 10, pitch and cutoff >> 3. The last code is the adaptive",
-        "; stream, a record only where a word moved. The table at the end holds",
-        f"; (pointer, word count) per run * {len(BLOCK_LENGTHS)} + code.",
+        "; amp >> 10, the amp's slope per frame, pitch and cutoff >> 3. The last",
+        "; code is the adaptive stream, a record only where a control moved off",
+        "; the slope's line. The table at the end holds (pointer, word count)",
+        f"; per run * {len(BLOCK_LENGTHS)} + code.",
         "",
     ]
     table = []
     for r, run in enumerate(RUNS):
-        left, right = pans(run.scenario)
-        controls = run_oracle(oracle, run.scenario, 1, "D", left, right)
-        if len(controls) != FRAMES:
-            raise SystemExit(f"error: the oracle dumped {len(controls)} control rows for {run.name}")
+        controls = controls_of(oracle, run.scenario)
         for n in range(len(BLOCK_LENGTHS)):
             words = payload(tables, run, controls, n)
             label = f"ctrl_run{r}_n{n}"
@@ -303,6 +354,14 @@ def sweep(oracle: Path, output: Path | None) -> None:
                 shapes.append(f"{correlation:.4f}/{spectral:.4f}")
             lines.append(f"  {mode:5s} " + "".join(f"{c:>14}" for c in cells) + f"   {doc}")
             lines.append("        " + "".join(f"{c:>14}" for c in shapes))
+        # The design itself: records where a control moved, aligned to the
+        # ramps' segment starts, the amp ramped per frame by each record's slope.
+        schedule = records(controls_of(oracle, scenario), BLOCK_LENGTHS.index("adaptive"))
+        got = run_oracle(oracle, scenario, 1, "S", left, right, schedule=schedule)
+        _text, ok, worst, worst_db, correlation, spectral = grade_channels(got, ref)
+        lines.append(f"  records on change with ramps, {len(schedule)} records: "
+                     f"{worst} words, {worst_db:.1f} dB{'*' if ok else ''}, "
+                     f"{correlation:.4f}/{spectral:.4f}")
         lines.append("")
     lines.append("  * = within the perceptual bounds")
     text = "\n".join(lines) + "\n"
@@ -385,6 +444,7 @@ def main() -> None:
         ("marker", "print the profiler marker for the run at --ncode"),
         ("cfg", "print the PROFILE.CFG text for the run at --ncode"),
         ("block", "print the block length of --ncode"),
+        ("records", "print the run's record schedule at --ncode"),
     ):
         p = sub.add_parser(name, help=doc)
         p.add_argument("run", type=int)
@@ -420,18 +480,17 @@ def main() -> None:
 
     def schedule():
         if args.oracle is None:
-            raise SystemExit("error: the adaptive schedule needs --oracle")
-        left, right = pans(run.scenario)
-        return records(run_oracle(args.oracle, run.scenario, 1, "D", left, right), args.ncode)
+            raise SystemExit("error: the record schedule needs --oracle")
+        return records(controls_of(args.oracle, run.scenario), args.ncode)
 
     if args.command == "segments":
-        sys.stdout.write(segments_text(run.scenario, schedule() if adaptive else None))
+        sys.stdout.write(segments_text(run.scenario, schedule()))
     elif args.command == "oracle-args":
+        # Every DSP run is compared with the oracle following its own record
+        # schedule, ramps included; the fixed block lengths differ from the
+        # adaptive stream only in where the records fall.
         left, right = pans(run.scenario)
-        if adaptive:
-            print(" ".join(oracle_args(run.scenario, 1, "S", left, right)))
-        else:
-            print(" ".join(oracle_args(run.scenario, BLOCK_LENGTHS[args.ncode], "APC", left, right)))
+        print(" ".join(oracle_args(run.scenario, 1, "S", left, right)))
     elif args.command == "name":
         print(f"{run.name}/{block_name(args.ncode)}")
     elif args.command == "kernel":
@@ -444,6 +503,9 @@ def main() -> None:
         print(BLOCK_LENGTHS[args.ncode])
     elif args.command == "summarize":
         summarize(args.listing, args.profile, len(schedule()), block_name(args.ncode), args.output)
+    elif args.command == "records":
+        for (start, ampt, slope, pitch, cutoff3), length in zip(schedule(), record_lengths(schedule())):
+            print(f"{start:5d} +{length:4d}: ampt {ampt:6d} slope {slope:5d} pitch {pitch} cutoff3 {cutoff3}")
 
 
 if __name__ == "__main__":

@@ -53,12 +53,13 @@ ramped every frame, because the LA32's fastest envelope moves it four
 percent per sample, and the cutoff sets the block length at sixteen frames,
 with 32 serving once no filter attack is running; the pitch is already
 re-evaluated only every eight samples by the MT-32's own MCU. So the host
-looks at each partial every sixteen frames and sends its amp, pitch and
-cutoff — three words and the frames they hold for — only where one of them
-moved, aligned to its envelope's segment starts, and the DSP derives the
-kernel's constants from whatever the record changed, which costs 240 to
-270 cycles per record and partial while the filter moves and nothing once
-the note has settled.
+looks at each partial every sixteen frames and sends its amp with its
+slope, pitch and cutoff — four words and the frames they hold for — only
+where one of them moved, aligned to the bends of its envelope, and the DSP
+derives the kernel's constants from whatever the record changed and ramps
+the amp every frame, which costs 250 to 360 cycles per record and partial
+while the filter moves, 2 to 5 cycles per frame in the kernels, and
+nothing per record once the note has settled.
 
 The second option is not free of consequences and they should be written down
 before anyone is surprised by them:

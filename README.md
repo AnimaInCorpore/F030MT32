@@ -49,14 +49,15 @@ two are answered and the answers are hard:
 1. **One LA32 partial costs 77 DSP cycles per codec frame as a square wave
    and 100 as a sawtooth when it reproduces Munt bit for bit, and 53 and 64
    when it leaves the log domain through single-table lookups within a few
-   output words of Munt; the reverb costs 92, the transport 12, and the
-   controls, which must move every 16 frames, 15 per partial while its
-   filter moves and nothing once the note has settled**, against a budget
-   of 489.40 per frame. After the transport, the reverb and the control
-   take their share, that is five to seven perceptual partials on the DSP
-   — a few timbres at a time, not a nine-part module — and nothing that
-   keeps the LA32's wave shape can reach the 15 cycles that thirty-two
-   partials would need. See [`docs/la32-budget.md`](docs/la32-budget.md).
+   output words of Munt, 58 and 69 with the amp ramped every frame; the
+   reverb costs 92, the transport 12, and the controls, which must move
+   every 16 frames, up to 23 per partial while its filter moves and
+   nothing once the note has settled**, against a budget of 489.40 per
+   frame. After the transport, the reverb and the control take their
+   share, that is four to six perceptual partials on the DSP — a few
+   timbres at a time, not a nine-part module — and nothing that keeps the
+   LA32's wave shape can reach the 15 cycles that thirty-two partials
+   would need. See [`docs/la32-budget.md`](docs/la32-budget.md).
 2. **The PCM ROM does not fit and never will, and the 68030 carries three
    PCM partials.** The ROM is 262,144 samples against 32,768 words of
    Falcon DSP SRAM, so the 68030 renders PCM partials and streams the
@@ -64,8 +65,8 @@ two are answered and the answers are hard:
    such partial costs 4.67 ms of every 15.62 ms period bit for bit and
    3.89 ms perceptually, and feeding the DSP costs 2.33 ms more, so the
    host holds three of them before it parses a byte of MIDI. Together with
-   the DSP's six synth partials that is the machine: a few timbres at a
-   time.
+   the DSP's four to six synth partials that is the machine: a few timbres
+   at a time.
 3. **The oracle harness exists for the wave generator only.** Munt is
    vendored under `third_party/munt`; `tools/la32_partial_oracle.cpp` drives
    its LA32 model and `tools/la32_partial.py` compares the DSP's output with
@@ -226,8 +227,9 @@ The intended contracts, in the order they have to be established:
    finds the control rate against Munt's per-sample envelopes, and
    `make profile-controls` measures the DSP deriving its constants per
    record, only what the record changed, from a host that sends one only
-   where a control moved: 240 to 270 cycles per record and partial while
-   the filter moves, none once the note has settled, bit-exact.
+   where a control moved, with the amp ramped every frame inside the
+   record: 250 to 360 cycles per record and partial while the filter
+   moves, none once the note has settled, bit-exact.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the
    production renderer — the same two-tier split F030MXDRV uses against
