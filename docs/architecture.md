@@ -57,7 +57,7 @@ looks at each partial every sixteen frames and sends its amp with its
 slope, pitch and cutoff — four words and the frames they hold for — only
 where one of them moved, aligned to the bends of its envelope, and the DSP
 derives the kernel's constants from whatever the record changed and ramps
-the amp every frame, which costs 250 to 360 cycles per record and partial
+the amp every frame, which costs 250 to 330 cycles per record and partial
 while the filter moves, 2 to 5 cycles per frame in the kernels, and
 nothing per record once the note has settled.
 

@@ -1505,8 +1505,17 @@ la32_derive_amp_rising:
         move    #>0,y1
         tmi     y1,b                    ; a truncated slope never lands below zero
         move    b1,y1                   ; the basis: the record's last frame
-        jsr     la32_derive_pow2        ; a1 = 2^(-|slope| * frames / 4096) * 2^21
-        jsr     la32_derive_unbias
+; F = 2^(-|slope| * frames / 4096), Q23, by the gain table's bins
+        move    x1,a
+        move    y:<la_m65535,x1
+        cmp     x1,a    y:<la_sh4,y0    ; y0 = 2^19: a right shift by 4
+        tgt     x1,a
+        move    a1,x1
+        mpy     x1,y0,a y:<la_gtab,x1
+        add     x1,a
+        move    a1,r0
+        nop
+        move    y:(r0),a
         asl     a
         asl     a                       ; Q23
         move    a1,y:<la_f
@@ -1541,10 +1550,19 @@ la32_derive_amp_basis:
         move    y:>la_cut_amp,x1
         add     x1,a
         move    a1,y:<la_ampt
-; the perceptual gain = 2^(-ampt/4096) * 2^21 from the amp term, signed per half
+; the perceptual gain, 2^(-ampt/4096) * 2^21, from the gain table's
+; sixteen-unit bins - the resonance's table, read at the bin the amp
+; term's top twelve bits name, the term clamped at 65535: one read where
+; the exponent table needs a fraction, a shift and a power of two
+        move    y:<la_m65535,x1
+        cmp     x1,a    y:<la_sh4,y0    ; y0 = 2^19: a right shift by 4
+        tgt     x1,a
         move    a1,x1
-        jsr     la32_derive_pow2
-        move    a1,x1
+        mpy     x1,y0,a y:<la_gtab,x1
+        add     x1,a
+        move    a1,r0
+        nop
+        move    y:(r0),x1
         move    x1,y:<la_half0+3
         move    x1,a
         neg     a

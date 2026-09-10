@@ -51,7 +51,7 @@ two are answered and the answers are hard:
    when it leaves the log domain through single-table lookups within a few
    output words of Munt, 58 and 69 with the amp ramped every frame; the
    reverb costs 92, the transport 12, and the controls, which must move
-   every 16 frames, up to 23 per partial while its filter moves and
+   every 16 frames, up to 22 per partial while its filter moves and
    nothing once the note has settled**, against a budget of 489.40 per
    frame. After the transport, the reverb and the control take their
    share, that is four to six perceptual partials on the DSP — a few
@@ -228,7 +228,7 @@ The intended contracts, in the order they have to be established:
    `make profile-controls` measures the DSP deriving its constants per
    record, only what the record changed, from a host that sends one only
    where a control moved, with the amp ramped every frame inside the
-   record: 250 to 360 cycles per record and partial while the filter
+   record: 250 to 330 cycles per record and partial while the filter
    moves, none once the note has settled, bit-exact.
 3. **Conformance.** Sample-level agreement with Munt at selected checkpoints
    for whatever subset the budget admits, then a perceptual gate for the

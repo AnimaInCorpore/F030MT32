@@ -16,8 +16,8 @@ listed at the bottom have started, and their numbers are the headline:
 > host carries three PCM partials beside the DSP's six. The controls must
 > move every 16 frames, with the amp ramped inside the record for 2 cycles
 > per frame in the exact kernels and 5 in the perceptual ones, and deriving
-> a partial's constants from them costs the DSP 250 to 360 cycles per
-> record while its filter moves — 17 to 23 per frame at that rate — and
+> a partial's constants from them costs the DSP 250 to 330 cycles per
+> record while its filter moves — 17 to 22 per frame at that rate — and
 > nothing once it has settled, because the host sends a record only where
 > a control moved.** All measured under the DSP-calibrated Hatari on
 > 2026-09-09 and 2026-09-10 (`make profile-partials`, `make
@@ -449,7 +449,10 @@ envelope phase — with the data-dependent right shifts as multiplies by a
 power of two from a table and the block's kernel entered through a stored
 address, and for the amp ramp the exact kernels' two amp words one slope
 before the record's first frame, the perceptual kernels' factor and its
-per-frame multiplier from a 1,024-word table of 2^(±s/4096). Every one of
+per-frame multiplier from a 1,024-word table of 2^(±s/4096), and the
+perceptual gain itself from the gain table the resonance reads, at the
+bin the amp term's top twelve bits name — one read, with a quantization
+of a sixteenth of a percent the resonance already carries. Every one of
 the 60 runs — six scenarios, both kernels, blocks of 8, 16, 32 and 64 and
 the adaptive stream below — matches the oracle following the same record
 schedule, the exact kernel word for word; one detail of Munt's order had
@@ -463,21 +466,22 @@ record, at sixteen frames:
 
 | Per record, one partial | Filter moving (pluck, string, brass) | Vibrato only | Settled |
 | --- | ---: | ---: | ---: |
-| Derivation, exact kernel | 189 – 219 | 90 | 51 |
-| Installing the position constants | 20 | 20 | 0 |
-| Record loop, kernel entry and exit | 43 | 44 | 27 |
-| **Total, exact kernel** | **252 – 283** | **154** | **78** |
-| **Total, perceptual kernel** | **309 – 357** | **208** | **100** |
+| Derivation, exact kernel | 191 – 221 | 81 | 58 |
+| Installing the position constants | 20 | 14 | 0 |
+| Record loop, kernel entry and exit | 44 | 36 | 20 |
+| **Total, exact kernel** | **255 – 285** | **131** | **78** |
+| **Total, perceptual kernel** | **296 – 330** | **171** | **118** |
 
-The perceptual kernel's extra is its gain and its ramp factors, three
-exponent lookups where the exact kernel needs none. The first version of
-the derivation cost 303 cycles per block whatever the record did;
-deriving on change and trading the `rep` shifts for multiplies took the
-worst case down by a fifth and the settled note by three quarters. What
-the worst case keeps is the arithmetic of the cutoff: two exponent
-lookups with their shifts, the segment lengths, the two log terms, about
-130 cycles of it, and no note spends long there — a filter attack lasts
-tens of milliseconds, a sustain the rest of the note.
+The perceptual kernel's extra is its gain, its ramp's factor and the
+factor's start, three table reads and the arithmetic around them; a first
+version took the gain and the start from the exponent table and cost 60
+cycles more. The first version of the derivation cost 303 cycles per
+block whatever the record did; deriving on change and trading the `rep`
+shifts for multiplies took the worst case down by a fifth and the settled
+note by three quarters. What the worst case keeps is the arithmetic of the
+cutoff: two exponent lookups with their shifts, the segment lengths, the
+two log terms, about 130 cycles of it, and no note spends long there — a
+filter attack lasts tens of milliseconds, a sustain the rest of the note.
 
 The rest of the saving is the host's. It looks at each partial every
 sixteen frames, at every start of a ramp segment and at every bend of a
@@ -490,17 +494,17 @@ partial:
 
 | Scenario | Records, of 128 looks | Fixed blocks of 16, exact | Records on change, exact | perceptual |
 | --- | ---: | ---: | ---: | ---: |
-| pluck, filter attack and decay | 137 | 16.0 | 16.9 | 20.7 |
-| string, slow swell with vibrato | 131 | 16.6 | 17.0 | 22.9 |
-| brass, filter sweep with a wide LFO | 138 | 17.8 | 19.1 | 23.3 |
-| release, both controls settling | 31 | 6.2 | 3.0 | 3.8 |
-| sustain, everything settled | 2 | 4.9 | 0.17 | 0.23 |
-| vibrato over settled amp and cutoff | 91 | 8.2 | 6.8 | 9.2 |
+| pluck, filter attack and decay | 137 | 16.0 | 16.9 | 19.6 |
+| string, slow swell with vibrato | 131 | 16.6 | 17.0 | 20.7 |
+| brass, filter sweep with a wide LFO | 138 | 17.8 | 19.1 | 22.0 |
+| release, both controls settling | 31 | 6.2 | 3.0 | 3.6 |
+| sustain, everything settled | 2 | 4.9 | 0.17 | 0.21 |
+| vibrato over settled amp and cutoff | 91 | 8.2 | 6.8 | 8.6 |
 
 A moving control costs what it cost, and a filter attack or a swell moves
 every look; a settled note costs the kernel and nothing else. Six
-perceptual partials at the sixteen-frame rate therefore cost about 130
-cycles per frame while their filters move, 55 under vibrato, and one
+perceptual partials at the sixteen-frame rate therefore cost about 125
+cycles per frame while their filters move, 50 under vibrato, and one
 settled. "About 20" was the right guess for a note's sustain and wrong by
 a factor of six for its attack, and what a real note costs is the
 attack's share of its length.
@@ -523,15 +527,15 @@ running; and nothing else running is not an option:
 | --- | ---: | --- |
 | Codec transport, receive by interrupt | 12 | measured, this page |
 | Boss reverb, room mode | 92 | measured, this page |
-| Per-record control, six perceptual partials, records on change | 1 to 130 | measured, this page: settled notes to filter attacks |
-| **Left for partials** | **about 255 to 385** | |
+| Per-record control, six perceptual partials, records on change | 1 to 125 | measured, this page: settled notes to filter attacks |
+| **Left for partials** | **about 260 to 385** | |
 
 | Kernel, amp ramped | Square | Sawtooth |
 | --- | ---: | ---: |
 | exact, 79 and 102, of 489 | 6.2 | 4.8 |
-| exact, of 255 | 3.2 | 2.5 |
+| exact, of 260 | 3.3 | 2.5 |
 | perceptual, 58 and 69, of 489 | 8.4 | 7.1 |
-| perceptual, of 255 | 4.4 | 3.7 |
+| perceptual, of 260 | 4.5 | 3.8 |
 | perceptual, of 385 | 6.6 | 5.6 |
 
 That is **four perceptual partials while every filter moves and six once
@@ -573,11 +577,11 @@ the starting condition, and the partial itself is close to its floor.
    in the exact kernel, the host sending a record only where a control
    moved took a settled partial from 4.4 cycles per frame to 0.17, and the
    amp ramps inside the record for 2 cycles per frame in the exact kernels
-   and 5 in the perceptual ones. What is left is about 40 cycles of the
-   attack path in long-addressed loads and two-word immediates that a
-   tighter register allocation could shave, and the perceptual kernel's
-   three exponent lookups per record, 60 to 75 cycles, which a table of
-   its gain by the amp term's top bits would make one lookup.
+   and 5 in the perceptual ones, and the perceptual kernel's gain and its
+   ramp's start come from the gain table's bins, one read each, which took
+   its records from 60 cycles over the exact kernel's to 40. What is left
+   is about 40 cycles of the attack path in long-addressed loads and
+   two-word immediates that a tighter register allocation could shave.
 2. **Move work between the halves.** The DSP is the busier chip in the
    planned configuration, at about 95 % with six partials and the reverb,
    and the host at about 90 % with three PCM partials and the transport,
@@ -649,7 +653,7 @@ done.
    it, and the program's own tick count repeats it on hardware.
 6. ~~**Find the control rate.**~~ Done: sixteen frames with the amp
    ramped inside the record, 32 when no filter attack is running; the
-   derivation costs 250 to 360 cycles per record and partial while the
+   derivation costs 250 to 330 cycles per record and partial while the
    filter moves, and a settled partial, whose host sends no records, costs
    nothing. `make control-sweep` and `make profile-controls` reproduce it.
 
