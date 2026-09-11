@@ -1,90 +1,53 @@
 # F030MT32
 
-F030MT32 aims to emulate a Roland MT-32 on an Atari Falcon030. The 68030 is to
-run the control half — MIDI reception, part and timbre state, partial
-allocation, and the PCM partial voices — while the Falcon DSP56001 runs the
-LA32 wave generator, the mixer, the Boss reverb, and the SSI transport to the
-codec.
+F030MT32 develops a Roland MT-32 emulator for the Atari Falcon030.
 
-The split, the two-stage DSP loader, the host/DSP word protocol, the
-double-buffered 512-frame period transport and the build system are taken from
-[`F030MXDRV`](../F030MXDRV), which plays Sharp X68000 MDX/PDX music by
-emulating a YM2151 on the same DSP. That project is finished enough to be a
-template; this one is not started.
+**Faithful MIDI file rendering and DSP playback now work as separate passes.**
+`MT32REND.TTP` runs Munt on the 68030 with the supplied control and PCM ROMs,
+all 32 partials, MIDI/SysEx, envelopes, allocation and reverb. It renders to
+`MT32.PCM`; `F030MT32.TTP W` plays that file through the DSP and codec.
+Rendering is much slower than real time on a stock Falcon. The same renderer
+can run on the workstation to prepare files for Falcon playback.
 
-## Project status
+See [the renderer guide](docs/falcon-renderer.md) for building, ROM filenames,
+command lines, supported MIDI files and validation. A real Falcon has not
+been tested yet; the current gates use calibrated Hatari with 4 MiB and no FPU.
 
-**This is a scaffold with one measured partial, not a synthesizer.** What
-exists is the skeleton the synthesizer will be built inside, plus the
-feasibility spike that decides how much of one fits:
+## Real-time synthesis status
 
-- a DSP program that boots through the embedded two-stage loader, answers the
-  v1 protocol, and drives the codec from two 512-frame stereo periods with a
-  boundary-safe handoff;
-- two audio sources for bring-up — a DSP-generated sine that needs no host
-  data path at all, and a host-supplied square wave that exercises the block
-  transfer — so the Falcon audio chain can be validated before any LA32 code
-  exists;
-- a 68030 program that boots the DSP, runs both sources, reports the codec
-  frame and period counters, and restores the sound system on every exit path;
-- the build system, the Hatari smoke gate, and the documented contracts;
-- one LA32 synth partial on the DSP in two kernels — one bit-exact against
-  Munt's integer model with its controls held per block, one perceptual —
-  and the Boss reverb, bit-exact, in a second DSP image, with the native
-  oracle and the Hatari profiling harness that measure all of them
-  (`make profile-partials`), and a transport profile that sorts whole
-  host-fed periods by what the DSP was doing (`make profile-transport`);
-- one PCM partial on the 68030, in an exact, a perceptual and a mono
-  kernel, checked against Munt from the file the program writes and timed
-  by Hatari's CPU profiler and by the program's own tick count
-  (`make profile-pcms`);
-- the control rate: envelopes and vibrato rendered per sample and held per
-  block by the oracle (`make control-sweep`), and rendered block by block
-  on the DSP, which derives its constants from each block's amp, pitch and
-  cutoff (`make profile-controls`).
+The assembly code remains a set of measured synthesis kernels and a working
+transport. Live MIDI reception and real-time voice scheduling are unfinished.
+The synth-partial and reverb kernels currently occupy separate DSP images.
 
-Of the three questions that decide whether the project is possible, the first
-two are answered and the answers are hard:
+The faithful real-time estimate is **2�4 synth partials on the DSP plus up to
+2 exact PCM partials on the 68030**, depending on waveform and control activity.
+That usually means roughly **1�3 complete multi-partial notes**, with some
+four-partial patches exceeding a resource pool even for one note. These are
+budget estimates, not a demonstrated live polyphony count.
 
-1. **One LA32 partial costs 77 DSP cycles per codec frame as a square wave
-   and 100 as a sawtooth when it reproduces Munt bit for bit, and 53 and 64
-   when it leaves the log domain through single-table lookups within a few
-   output words of Munt, 58 and 69 with the amp ramped every frame; the
-   reverb costs 92, the transport 12, and the controls, which must move
-   every 16 frames, up to 22 per partial while its filter moves and
-   nothing once the note has settled**, against a budget of 489.40 per
-   frame. After the transport, the reverb and the control take their
-   share, that is four to six perceptual partials on the DSP — a few
-   timbres at a time, not a nine-part module — and nothing that keeps the
-   LA32's wave shape can reach the 15 cycles that thirty-two partials
-   would need. See [`docs/la32-budget.md`](docs/la32-budget.md).
-2. **The PCM ROM does not fit and never will, and the 68030 carries three
-   PCM partials.** The ROM is 262,144 samples against 32,768 words of
-   Falcon DSP SRAM, so the 68030 renders PCM partials and streams the
-   result, exactly as F030MXDRV streams decoded PDX ADPCM. Measured, one
-   such partial costs 4.67 ms of every 15.62 ms period bit for bit and
-   3.89 ms perceptually, and feeding the DSP costs 2.33 ms more, so the
-   host holds three of them before it parses a byte of MIDI. Together with
-   the DSP's four to six synth partials that is the machine: a few timbres
-   at a time.
-3. **The oracle harness exists for the wave generator only.** Munt is
-   vendored under `third_party/munt`; `tools/la32_partial_oracle.cpp` drives
-   its LA32 model and `tools/la32_partial.py` compares the DSP's output with
-   it word for word. Nothing compares envelopes, allocation or MIDI yet.
+Current measurements per codec frame are 79/102 DSP cycles for an exact
+square/saw partial, 58/69 for the approximate kernels, 152 for corrected room
+reverb, and 14.81 for interrupt-driven transport. Changing controls adds up
+to about 22 cycles per partial. The total budget is 489.40. A PCM partial
+costs 4.67 ms of a 15.62 ms period bit-exact, plus 2.33 ms per mixed stereo
+upload. [The budget](docs/la32-budget.md) explains the limits and assumptions.
 
-Treat every architectural statement in `docs/` as a proposal with its
-evidence named, not as a description of working code.
+The hardware MT-32 has 32 **partials**, with one to four used per note, hence
+8�32 simultaneous notes. MIDI's 16 channels do not specify a polyphony limit.
+The offline renderer retains the full 32-partial pool because it does not
+have a real-time deadline.
 
-## Legal position on the ROMs
+## ROMs and third-party code
 
-The MT-32 needs Roland's control ROM (64 KiB) and PCM ROM (512 KiB). Those are
-copyrighted firmware and are **not** part of this repository and must not be
-committed to it. `roms/` is ignored, the way `corpus/` is in F030MXDRV; supply
-your own dump from hardware you own.
+ROM images are external inputs and are never embedded in an executable or
+tracked in Git. `roms/`, generated output, and the supplied ROM archive are
+ignored. The selected MT-32 1.07 control and PCM images match Munt's SHA-1
+catalogue; the [renderer guide](docs/falcon-renderer.md) records their hashes.
 
-`third_party/munt` is the Munt project. Its `mt32emu` library is LGPL-2.1;
-this repository uses it as a build-time reference oracle only, and no Munt
-code is linked into anything that runs on the Falcon.
+`third_party/munt/mt32emu` is LGPL-2.1-or-later. The assembly player uses it
+only as a build-time oracle; the separate `MT32REND.TTP` offline renderer
+statically links it. Its source and licence notices remain in the pinned
+submodule, and the Makefile retains the objects needed for relinking.
 
 ## Build
 
@@ -130,6 +93,12 @@ make check
 
 | Target | Purpose | Extra input |
 | --- | --- | --- |
+| `make renderer` | build the full native ROM/MIDI renderer | C++17 |
+| `make falcon-renderer` | build the offline 68030 renderer | m68k-atari-mintelf-g++ |
+| `make check-midi` | test SMF timing, merging and error handling | C++17 |
+| `make check-player` | verify file decoding, all sample uploads and final draining | Hatari |
+| `make check-rom-renderer` | compare complete short Falcon renders with native output | ROMs, cross C++, Hatari |
+| `make check-reverb` | six long overflow regressions against Munt | Hatari |
 | `make all` | build the Falcon executable and the DSP image | DOSBox |
 | `make check` | build everything and validate the generated artefacts | DOSBox |
 | `make smoke` | score boot and transport under Hatari | Hatari |
@@ -149,7 +118,8 @@ The outputs are:
 
 ```text
 release/f030mt32.tos  self-test, bring-up and profile program
-release/f030mt32.ttp  the same program with a Desktop command-line entry
+release/f030mt32.ttp  the same program; W plays a rendered MT32.PCM file
+release/mt32rend.ttp  full offline MIDI renderer, from make falcon-renderer
 release/mt32verb.tos  the traced build, from `make verbose`
 release/la32.lod      readable DSP assembler artifact, the partial image
 release/reverb.lod    the same source assembled as the reverb image
@@ -162,13 +132,14 @@ is ignored and is never removed by that target.
 
 With no command tail the program runs a fixed, non-interactive self-test: it
 boots the DSP, plays the DSP-generated tone for forty vertical blanks, reports
-the codec frame and period counters, then feeds thirty-two host-supplied
+the codec frame and period counters, then checks continued codec timing through an 80-VBL host stall and feeds thirty-two host-supplied
 periods through the same transport and reports again.
 
 ```text
 F030MT32.TTP           scored self-test, exits on its own
 F030MT32.TTP TONE      hold the DSP tone until a keypress
 F030MT32.TTP STREAM    hold the host-fed square wave until a keypress
+F030MT32.TTP W         play MT32.PCM from the offline renderer
 ```
 
 Only the first letter of the tail is examined, so `T` and `tone` also work and

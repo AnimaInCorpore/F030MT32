@@ -34,6 +34,7 @@ MODE_STREAM     equ     2
 MODE_PROFILE    equ     3
 MODE_PCM        equ     4
 MODE_CONTROL    equ     5
+MODE_FILE       equ     6
 
 PCM_CFG_BYTES   equ     40              ; tools/pcm_partial.py config_longs
 PCM_OUTPUT_BYTES equ    20+8*PCM_PROFILE_FRAMES
@@ -42,6 +43,7 @@ PCM_OUTPUT_BYTES equ    20+8*PCM_PROFILE_FRAMES
 ; the frame counter, short enough for a non-interactive emulator run.
 SELFTEST_TONE_VBLS equ      40
 SELFTEST_STREAM_PERIODS equ 32
+SELFTEST_STREAM_STALL_VBLS equ 80       ; > one wrap of the SSI's 16-bit word counter
 
 ; The host-supplied source is a square wave one octave below the DSP tone, so
 ; the two paths are told apart by ear as well as by the trace. The samples are
@@ -138,6 +140,8 @@ start_image_known:
         beq     dispatch_stream
         cmpi.l  #MODE_TONE,d0
         beq     dispatch_tone
+        cmpi.l  #MODE_FILE,d0
+        beq     dispatch_file
 
 ; The default run is non-interactive so an emulator gate can score it: play
 ; the DSP tone, prove the codec frame counter advanced, then hand the same
@@ -155,6 +159,12 @@ dispatch_tone:
         bsr     run_tone_interactive
         tst.l   d0
         bne     audio_failed
+        bra     clean_exit
+
+dispatch_file:
+        bsr     run_file
+        tst.l   d0
+        bne     file_failed_exit
         bra     clean_exit
 
 dispatch_stream:
@@ -353,6 +363,8 @@ read_profile_cfg:
         beq.s   read_profile_cfg_pcm
         cmpi.b  #'C',d0
         beq.s   read_profile_cfg_control
+        cmpi.b  #'W',d0
+        beq     parse_tail_file
         bra     read_profile_cfg_dsp
 read_profile_cfg_pcm:
         cmpi.l  #3,d6
@@ -473,6 +485,25 @@ run_tone_interactive_failed:
 ; out: d0.l = 0 on success
 run_stream_selftest:
         bsr     start_stream
+        tst.l   d0
+        bne     run_stream_selftest_failed
+
+        ; The active period must keep clocking without a host refill. Wait
+        ; longer than the 16-bit SSI word counter takes to wrap, then check
+        ; that QUERY_TIME advanced while the handoff count stayed zero.
+        move.l  #MT32_CMD_QUERY_TIME,d0
+        bsr     dsp_exchange
+        move.l  d0,d4
+        move.w  #SELFTEST_STREAM_STALL_VBLS,d7
+        bsr     wait_vbls
+        move.l  #MT32_CMD_QUERY_TIME,d0
+        bsr     dsp_exchange
+        sub.l   d4,d0
+        andi.l  #$ffffff,d0
+        cmpi.l  #32768,d0
+        blo.s   run_stream_selftest_failed
+        move.l  #MT32_CMD_QUERY_PERIODS,d0
+        bsr     dsp_exchange
         tst.l   d0
         bne.s   run_stream_selftest_failed
 
@@ -657,11 +688,16 @@ parse_tail_skip:
         beq.s   parse_tail_tone
         cmpi.b  #'S',d0
         beq.s   parse_tail_stream
+        cmpi.b  #'W',d0
+        beq.s   parse_tail_file
 parse_tail_default:
         moveq   #MODE_SELFTEST,d0
         rts
 parse_tail_tone:
         moveq   #MODE_TONE,d0
+        rts
+parse_tail_file:
+        moveq   #MODE_FILE,d0
         rts
 parse_tail_stream:
         moveq   #MODE_STREAM,d0
@@ -741,6 +777,9 @@ pcm_failed:
         bra.s   fail_exit
 control_failed:
         Cconws  control_error_text
+        bra.s   fail_exit
+file_failed_exit:
+        Cconws  file_error_text
 fail_exit:
         bsr     sound_close
         move.w  #1,-(sp)
@@ -845,6 +884,8 @@ pcm_error_text:
         dc.b    'PCM partial spike failed',13,10,0
 control_error_text:
         dc.b    'control-rate spike failed',13,10,0
+file_error_text:
+        dc.b    'MT32.PCM is missing, invalid, truncated, or could not be played',13,10,0
         even
 
 ; The control-run payloads: static constants and per-block records for

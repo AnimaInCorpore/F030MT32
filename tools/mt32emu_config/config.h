@@ -1,6 +1,6 @@
-/* Minimal stand-in for the CMake-generated mt32emu config.h, enough to
- * compile the LA32 wave generator and its tables into the native oracle
- * without configuring the whole library. Nothing here reaches the Falcon. */
+/* Minimal stand-in for CMake's config.h, shared by the partial oracle and
+ * the full native/Falcon offline renderer. The renderer enables Munt's
+ * internal resampler explicitly in its build flags. */
 #ifndef MT32EMU_CONFIG_H
 #define MT32EMU_CONFIG_H
 

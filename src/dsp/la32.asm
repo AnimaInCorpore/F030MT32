@@ -9,8 +9,8 @@
 ;   MT32_CMD_START_STREAM  the 68030 supplies every period
 ;
 ; The boot sequence, the SSI configuration, the fast transmit interrupt, the
-; modulo output pointer and the handoff are taken unchanged from the measured
-; F030MXDRV production path; only the synthesis they wrap is different. See
+; modulo output pointer and the handoff derive from the measured F030MXDRV
+; path. This port adds interrupt reception and a running SSI word clock. See
 ; docs/architecture.md for what replaces the tone generator, and
 ; docs/dsp56001-notes.md for the DSP56001 rules this file already obeys.
 ;
@@ -49,6 +49,25 @@ LA32_CONFIG_WORDS   equ     18
 LA32_OUTPUT_BASE    equ     $1000
 LA32_OUTPUT_WORDS   equ     2*LA32_PROFILE_FRAMES
 
+; The regression image fills all of the free external X bank. Production
+; profiles retain their original size; both use the same reverb loop.
+        IF      @DEF(LA32_REVERB_STRESS)
+LA32_REVERB_FRAMES  equ     6144
+        ELSE
+LA32_REVERB_FRAMES  equ     LA32_PROFILE_FRAMES
+        ENDIF
+
+; Munt's integer delay network narrows at each IntSample assignment. Its
+; final mixer saturates, but intermediate additions wrap to signed 16 bits.
+; Scratch registers must not contain a live tap or feedback coefficient.
+rv_wrap16 macro acc,maskreg,signreg
+        move    y:<rv_wordmask,maskreg
+        move    y:<rv_sign16,signreg
+        and     maskreg,acc
+        eor     signreg,acc
+        sub     signreg,acc
+        endm
+
 ; Boss reverb, MT-32 room mode: delay-line homes in Y (mirrored by the
 ; Python tool, which checks each base is aligned to the power of two above
 ; the line's length, as modulo addressing requires) and the fixed tap
@@ -80,13 +99,22 @@ RV_TAP_L3           equ     -1814
 ; Buffered SSI owns r6/m6 while active. The normal fast interrupt transfers
 ; one prepared word without disturbing any synthesis state. The exception
 ; vector enters a recovery ISR because clearing TUE requires reading SSISR and
-; then writing TX; the normal path stays a two-instruction fast interrupt.
+; then writing TX. r7/m7 counts queued words without touching the CCR;
+; foreground accounting subtracts the transmitter pipeline and extends it.
         org     p:$10
         movep   x:(r6)+,x:m_tx
-        nop
+        lua     (r7)+,r7
 
         org     p:$12
         jsr     ssi_tx_exception
+
+; Enabled only for a fixed-size period upload, after r0 is installed and
+; before RDY is sent. The host waits for the acknowledgement before sending
+; another command, so HRIE is disabled before command bytes can arrive.
+        org     p:$20
+host_receive_isr:
+        movep   x:m_hrx,x:(r0)+
+        nop
 
 ; -----------------------------------------------------------------------------
 ; Scalar state in internal Y (internal X is the unlog table's first page)
@@ -113,6 +141,13 @@ tone_phase:
 tone_step:
         ds      1                       ; 16-bit phase increment per frame
 
+        org     y:$80
+ssi_last_words  ds      1               ; last observed 16-bit r7
+ssi_word_odd    ds      1               ; leftover word from frame accounting
+ssi_prime      ds      1               ; first word starts, rather than completes, a frame
+ssi_receive_end ds     1               ; one past the private period upload
+ssi_reply      ds      1               ; reply held while the host stalls
+
         IF      @DEF(LA32_REVERB_IMAGE)
 
 ; Reverb image: the run's constants, copied from the configuration image by
@@ -138,6 +173,8 @@ rv_half         ds      1               ; 2^22: mpy by it is a right shift by 1
 rv_pad          ds      2
 rv_outl1        ds      1               ; scratch: comb 1's oldest word
 rv_outr3        ds      1               ; scratch: comb 3's last word
+rv_wordmask     ds      1               ; $ffff: intermediate IntSample wrapping
+rv_sign16       ds      1               ; $8000: convert unsigned 16 to signed
 
         ELSE
 
@@ -290,7 +327,8 @@ ssi_buffer_b:
         org     p:$80
 
 la32_reverb_run:
-        do      #LA32_PROFILE_FRAMES,la32_reverb_done
+        move    #>LA32_REVERB_FRAMES,x0
+        do      x0,la32_reverb_done
 la32_reverb_loop:
 ; dry input
         move    y:<rv_quarter,y0
@@ -313,25 +351,31 @@ la32_reverb_loop:
         mpy     x0,y0,a                     ; a1 = oldest >> 1
         move    a1,y1
         sub     y1,b                        ; b1 = new
+        rv_wrap16 b,x1,y1
         move    b1,x1
-        mpy     x1,y0,a   b,y:(r1)+         ; a1 = new >> 1; store, advance
+        mpy     x1,y0,a   b1,y:(r1)+        ; a1 = new >> 1; store, advance
         add     x0,a                        ; a1 = link
+        rv_wrap16 a,x1,y1
 ; allpass 1
         tfr     a,b       y:(r2),x0
         mpy     x0,y0,a
         move    a1,y1
         sub     y1,b
+        rv_wrap16 b,x1,y1
         move    b1,x1
-        mpy     x1,y0,a   b,y:(r2)+
+        mpy     x1,y0,a   b1,y:(r2)+
         add     x0,a
+        rv_wrap16 a,x1,y1
 ; allpass 2; the first comb's feedback factor rides on its last add
         tfr     a,b       y:(r3),x0
         mpy     x0,y0,a
         move    a1,y1
         sub     y1,b
+        rv_wrap16 b,x1,y1
         move    b1,x1
-        mpy     x1,y0,a   b,y:(r3)+
+        mpy     x1,y0,a   b1,y:(r3)+
         add     x0,a      y:<rv_fb1,y0
+        rv_wrap16 a,x1,y1
         move    a1,x1                       ; x1 = link into the combs
 ; comb 1; its oldest word is the first left tap
         move    y:(r4)+,x0                  ; last; r4 -> oldest
@@ -339,27 +383,33 @@ la32_reverb_loop:
         mpy     y1,y0,a   y:<rv_ffc,y0      ; a1 = oldest * feedback >> 8
         add     x1,a      y1,y:<rv_outl1    ; a1 = filter input; keep the tap
         mpy     x0,y0,b   y:<rv_fb2,y0      ; b1 = last * $60 >> 8; next feedback
+        rv_wrap16 a,x0,y1
         move    a1,y1
         sub     y1,b                        ; b1 = new
-        move    b,y:(r4)                    ; store at the new index
+        rv_wrap16 b,x0,y1
+        move    b1,y:(r4)                   ; store at the new index
 ; comb 2
         move    y:(r5)+,x0
         move    y:(r5),y1
         mpy     y1,y0,a   y:<rv_ffc,y0
         add     x1,a
         mpy     x0,y0,b   y:<rv_fb3,y0
+        rv_wrap16 a,x0,y1
         move    a1,y1
         sub     y1,b
-        move    b,y:(r5)
+        rv_wrap16 b,x0,y1
+        move    b1,y:(r5)
 ; comb 3; its last word is the third right tap, and half is next
         move    y:(r7)+,x0
         move    y:(r7),y1
         mpy     y1,y0,a   y:<rv_ffc,y0
         add     x1,a      x0,y:<rv_outr3
         mpy     x0,y0,b   y:<rv_half,y0
+        rv_wrap16 a,x0,y1
         move    a1,y1
         sub     y1,b
-        move    b,y:(r7)
+        rv_wrap16 b,x0,y1
+        move    b1,y:(r7)
 ; left output: 1.5 * comb 1's oldest + 1.5 * comb 2's tap + comb 3's tap,
 ; clipped and scaled by the wet level. A tap is read by stepping the comb's
 ; pointer forward by the offset and back, two plain moves that ride on the
@@ -822,7 +872,7 @@ start:
                                         ; loader that would clear them; the
                                         ; Falcon SRAM needs none and Hatari
                                         ; ignores the register entirely
-        movep   #$3000,x:m_ipr          ; SSI interrupt priority level 2
+        movep   #$3800,x:m_ipr          ; SSI IPL 2, host receive IPL 1
         andi    #$fc,mr                 ; reset leaves I1:I0=11 masking IPL 2;
                                         ; the SSI ISR needs the mask lowered
         move    #>-1,m0                 ; linear addressing for the period
@@ -986,6 +1036,10 @@ command_control:
 ; the entrance and the combs at slot 0, the allpasses at slot 1, which is
 ; the slot their first frame reads and writes.
 reverb_prepare:
+        move    #>$00ffff,x0
+        move    x0,y:<rv_wordmask
+        move    #>$008000,x0
+        move    x0,y:<rv_sign16
         clr     a
         move    #>-1,m0
         move    #>RV_ENT_BASE,r0
@@ -1655,6 +1709,7 @@ tone_loop:
         move    y:ssi_refill_base,r0
         jsr     render_tone_period
 tone_wait:
+        jsr     ssi_poll_time
         move    y:ssi_active_base,x0
         move    r6,a
         cmp     x0,a
@@ -1679,6 +1734,7 @@ tone_wait:
         jmp     tone_wait
 
 tone_query_time:
+        jsr     ssi_update_time
         move    y:ssi_frame_count,a
         jsr     send_reply
         jmp     tone_wait
@@ -1706,6 +1762,7 @@ command_start_stream:
 
 ; While buffered audio is active, accept refills, queries, and stop.
 stream_loop:
+        jsr     ssi_poll_time
         jclr    #0,x:m_hsr,stream_loop
         movep   x:m_hrx,x1
         move    x1,y:last_command
@@ -1729,6 +1786,7 @@ stream_loop:
         jmp     stream_loop
 
 stream_query_time:
+        jsr     ssi_update_time
         move    y:ssi_frame_count,a
         jsr     send_reply
         jmp     stream_loop
@@ -1759,13 +1817,16 @@ command_refill_stream:
 ; outrunning this loop.
 ; in: r0 = destination base
 receive_period:
+        move    r0,a
+        move    #>MT32_PERIOD_WORDS,x0
+        add     x0,a
+        move    a1,y:ssi_receive_end
+        bset    #m_hrie,x:m_hcr
         move    #>MT32_REPLY_BLOCK_READY,a
         jsr     send_reply
-        do      #MT32_PERIOD_WORDS,receive_period_done
-        jclr    #0,x:m_hsr,*
-        movep   x:m_hrx,a
-        move    a1,x:(r0)+
+        jmp     receive_period_wait
 receive_period_done:
+        bclr    #m_hrie,x:m_hcr
         rts
 
 ; -----------------------------------------------------------------------------
@@ -1778,6 +1839,14 @@ ssi_configure:
         clr     a
         move    a1,y:ssi_frame_count
         move    a1,y:ssi_period_count
+        move    a1,y:ssi_last_words
+        move    a1,y:ssi_word_odd
+        move    a1,r7
+        move    #>-1,m7
+        move    #>-1,m0
+        move    #>-1,m1
+        move    #>1,x0
+        move    x0,y:ssi_prime
         move    #>ssi_buffer_a,a
         move    a1,y:ssi_active_base
         move    #>ssi_buffer_b,a
@@ -1793,8 +1862,6 @@ ssi_begin:
         nop
         move    x:(r6)+,a
         movep   a1,x:m_tx
-        move    #>MT32_PERIOD_FRAMES,a
-        move    a1,y:ssi_frame_count
         move    #>MT32_REPLY_OK,a
         jsr     send_reply
         movep   #$5a00,x:m_crb          ; network TX + SSI transmit interrupt
@@ -1806,6 +1873,8 @@ ssi_begin:
 ssi_wait_boundary:
         move    y:ssi_active_base,x0
 ssi_wait_boundary_loop:
+        jsr     ssi_poll_time
+        move    y:ssi_active_base,x0
         move    r6,a
         cmp     x0,a
         jne     ssi_wait_boundary_loop
@@ -1820,6 +1889,7 @@ ssi_perform_handoff:
         move    r6,a
         jclr    #0,a1,ssi_handoff_even
         movep   x:(r6)+,x:m_tx
+        lua     (r7)+,r7
         jclr    #m_tde,x:m_sr,*
 ssi_handoff_even:
         move    y:ssi_active_base,a
@@ -1827,12 +1897,10 @@ ssi_handoff_even:
         move    b1,y:ssi_active_base
         move    a1,y:ssi_refill_base
         move    b1,r6
-        move    y:ssi_frame_count,a
-        move    #>MT32_PERIOD_FRAMES,x0
-        add     x0,a
-        move    a1,y:ssi_frame_count
+        nop
         move    x:(r6)+,a
         movep   a1,x:m_tx
+        lua     (r7)+,r7
         movep   #$5a00,x:m_crb
         move    y:ssi_period_count,a
         move    #>1,x0
@@ -1842,6 +1910,7 @@ ssi_handoff_even:
 
 command_stop_audio:
         movep   #0,x:m_crb
+        jsr     ssi_update_time
         move    #>-1,m6
         clr     a
         movep   a1,x:m_tx
@@ -1856,11 +1925,15 @@ command_stop_audio:
 ssi_tx_exception:
         movep   x:m_sr,y:ssi_status_snapshot
         movep   x:(r6)+,x:m_tx
+        lua     (r7)+,r7
         rti
 
 ; Send a single 24-bit reply from a1.
 send_reply:
-        jclr    #1,x:m_hsr,*            ; wait for host transmit data empty
+        move    a1,y:ssi_reply
+        jmp     send_reply_wait
+send_reply_ready:
+        move    y:ssi_reply,a
         movep   a1,x:m_htx
         rts
 
@@ -1875,6 +1948,10 @@ mt32_reset:
         move    a1,y:ssi_status_snapshot
         move    a1,y:tone_phase
         move    a1,y:source_mode
+        move    a1,r7
+        move    a1,y:ssi_last_words
+        move    a1,y:ssi_word_odd
+        move    a1,y:ssi_prime
         move    #>MT32_TONE_A440_STEP,a
         move    a1,y:tone_step
         move    #>ssi_buffer_a,a
@@ -1907,6 +1984,68 @@ render_tone_period:
 render_tone_period_done:
         move    a1,y:tone_phase
         rts
+
+; This common P island is above the reverb's last comb word ($1e2c) and
+; the partial image's control header ($1e00-$1e15), below its $2000 tables.
+; The regular foreground loops sample r7 at least once per period, including
+; while an unresponsive host holds up a reply. Its 16-bit wrap (~1 second)
+; is extended to the protocol's 24-bit frame counter. The count is at most
+; one frame behind the wire, and never advances with a stopped SSI clock.
+        org     p:$1e40
+ssi_poll_time:
+        move    r7,a
+        move    y:ssi_last_words,x0
+        sub     x0,a
+        move    #>$00ffff,x0
+        and     x0,a
+        move    #>128,x0
+        cmp     x0,a
+        jlt     ssi_poll_done
+        jmp     ssi_update_time
+ssi_poll_done:
+        rts
+
+ssi_update_time:
+        move    y:source_mode,a
+        tst     a
+        jeq     ssi_update_done
+        move    r7,a
+        move    y:ssi_last_words,x0
+        move    a1,y:ssi_last_words
+        sub     x0,a
+        move    #>$00ffff,x0
+        and     x0,a
+        tst     a
+        jeq     ssi_update_done
+        move    y:ssi_prime,x0
+        sub     x0,a
+        move    #>0,x0
+        move    x0,y:ssi_prime
+        move    y:ssi_word_odd,x0
+        add     x0,a
+        move    a1,b
+        move    #>1,x0
+        and     x0,b
+        move    b1,y:ssi_word_odd
+        asr     a
+        move    y:ssi_frame_count,x0
+        add     x0,a
+        move    a1,y:ssi_frame_count
+ssi_update_done:
+        rts
+
+receive_period_wait:
+        jsr     ssi_poll_time
+        move    r0,a
+        move    y:ssi_receive_end,x0
+        cmp     x0,a
+        jne     receive_period_wait
+        jmp     receive_period_done
+
+send_reply_wait:
+        jset    #1,x:m_hsr,send_reply_ready
+        jsr     ssi_poll_time
+        jmp     send_reply_wait
 
 ; The generated tables are P-memory data, not code: the stage-two loader
 ; carries P sections only, and generate_dsp_stage2.py fails the build if the

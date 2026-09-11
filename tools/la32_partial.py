@@ -509,13 +509,15 @@ def emit_tables(tables: Tables) -> str:
     return "\n".join(lines) + "\n"
 
 
-def emit_reverb_tables(input_frames: Path) -> str:
+def emit_reverb_tables(input_frames: Path, frames: int = PROFILE_FRAMES) -> str:
     """The reverb image: every run's constants plus the input frames, placed
     at the P alias of X:$1000 so the loader lands them where the loop reads
     and overwrites them in place."""
     rows = read_oracle(input_frames)
-    if len(rows) != PROFILE_FRAMES:
-        raise SystemExit(f"error: {input_frames} has {len(rows)} frames, expected {PROFILE_FRAMES}")
+    if len(rows) != frames:
+        raise SystemExit(f"error: {input_frames} has {len(rows)} frames, expected {frames}")
+    if not 0 < frames <= (0x4000 - OUTPUT_BASE) // 2:
+        raise SystemExit("error: reverb input does not fit the external X bank")
     for name, (size, base) in REVERB_LINES.items():
         block = 1
         while block < size:

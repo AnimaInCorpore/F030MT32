@@ -1,6 +1,7 @@
 /build/
 /release/
 /roms/
+/assets/MT-32_and_CM-32L_MAME-Versioned_ROM_files..zip
 /.claude/
 __pycache__/
 *.py[cod]

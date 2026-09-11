@@ -5,7 +5,9 @@ and **doing what an MT-32 does with them**. The second is read out of the
 vendored Munt source; the first is Atari hardware and is marked where it needs
 confirming against the hardware manual rather than against this page.
 
-Nothing on this page is implemented.
+The offline renderer implements the MIDI control model through Munt and reads
+SMF format 0/1 files in `src/host/smf.cpp`. Live MIDI input and the proposed
+real-time DSP control path remain unimplemented; see [the renderer guide](falcon-renderer.md).
 
 ## Getting bytes off the Falcon
 

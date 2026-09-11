@@ -1,10 +1,12 @@
 # Architecture
 
-Everything below the "Implemented" heading is a **proposal**. The transport is
-built and gated; the synthesizer is not started. Where a claim rests on
-evidence, the evidence is named; where it does not, it says so.
+The real-time CPU/DSP synthesis split below remains a proposal. The transport,
+file player and profiling kernels are implemented. A separate full Munt
+renderer now runs offline on the 68030 or workstation; see
+[the renderer guide](falcon-renderer.md). It uses native-rate synthesis and
+accurate resampling, rather than the proposed codec-rate live kernel.
 
-## Ownership
+## Proposed real-time ownership
 
 | Side | Owns |
 | --- | --- |
@@ -23,7 +25,7 @@ problem on top of the one that already matters.
 The one place the analogy breaks is PCM, and it breaks hard. See
 [The PCM ROM problem](#the-pcm-rom-problem).
 
-## Rates and the resampling decision
+## Proposed real-time rates and resampling
 
 The Falcon codec runs at 25,175,000 / 256 / (prescale+1). Prescale 2 gives
 **32,779.947916 Hz**, the closest available rate to the MT-32's 32,000 Hz.
@@ -120,9 +122,8 @@ word on TXDE itself (`dsp_blast_paced`) rather than trusting the XBIOS call.
 F030MXDRV lost real hardware time to this; Hatari does not reproduce it,
 because its DSP has no host-port wait states.
 
-Opcode `0a` is the LA32 profile spike (`MT32_CMD_PROFILE_PARTIAL`, see
-[`la32-budget.md`](la32-budget.md)); `0b` upwards are unallocated and are
-where the synthesizer goes.
+Opcode `0a` is the LA32 profile spike and `0b` runs uploaded control records;
+see `src/dsp/protocol.inc`. Live voice scheduling has no opcode yet.
 
 ## Boot
 
@@ -150,14 +151,16 @@ limit, non-P sections, and sections outside 16-bit P memory.
 | P | `$0000-$003f` | reset and interrupt vectors |
 | P | `$0040-$007f` | reserved for the transient stage-two loader |
 | P | `$0080-$01ff` | internal: the four LA32 partial render loops, or the reverb loop in the reverb image |
-| P | `$0200-$05ff` | external: command loop, transport, profile command |
+| P | `$0200-$06ff` | external: command loop, transport, profile command |
+| P | `$1e40-$1fff` | transport clock and wait helpers; clear of both images� data |
 | P | `$0700-$07ff` | LA32 constant and run configuration images |
 | P | `$0800-$08ff` | test-tone table image, aliased to `Y:$0800` |
 | P | `$0900-$3bff` | LA32 Y tables — gain, resonance, windows, signed sine — aliased to the same Y addresses |
 | P | `$4000-$4fff`, `$6000-$783f` | LA32 X tables — exponent, square values, cosine, power — aliased to `X:$0000` and `X:$2000` upwards |
 | P | `$5000-$5fff` | reverb image only: the input frames, aliased to `X:$1000` |
 | X | `$0000-$00ff` | internal: first page of the exponent table, copied from P at boot |
-| Y | `$0000-$003f` | internal: scalar transport state, LA32 or reverb constants and configuration |
+| Y | `$0000-$007f` | internal: scalar transport and synthesis state |
+| Y | `$0080-$0084` | SSI clock extension, receive boundary and saved reply |
 | Y | `$0c00-$3ed8` | reverb image only: the seven delay lines, each in a power-of-two-aligned block for modulo addressing |
 | X | `$1000-$13ff` | external: period buffer A, and the profile spikes' output |
 | X | `$1400-$17ff` | external: period buffer B |
@@ -234,7 +237,7 @@ and not a decision.
 Its cost is measured (`make profile-pcms`, [`la32-budget.md`](la32-budget.md#a-pcm-partial-on-the-68030)):
 one PCM partial rendered bit-exactly against Munt costs the 68030 4.67 ms
 of every 15.62 ms period, a perceptual kernel 3.89 ms, and feeding the DSP
-a stereo period 2.33 ms more, so the host holds three PCM partials with
+a stereo period 2.33 ms more, so the host holds two exact or three approximate PCM partials with
 nothing else running. Three word multiplies at about 22 cycles each and two
 long stores to ST-RAM are three quarters of the kernel's 122 cycles per
 frame, which is why no cheaper renderer is in sight: the interpolation and
@@ -263,20 +266,23 @@ later: F030MXDRV's measurements show the receive moving into the boundary wait
 changes where the cycles are *counted*, not just when they are spent, and every
 occupancy figure depends on which model is in force.
 
-One part of it will not transfer unchanged. `make profile-transport` measures
-the scaffold's polled receive at 7 DSP cycles of its own per word plus 29
-stalled on the 68030, which delivers a word every 2.27 µs under the
-calibrated host-port model; F030MXDRV hides that stall in a boundary wait
-that its synthesis leaves idle. Five LA32 partials and the reverb leave no
-such idle, so the production kernel takes the host's words through the host
-receive interrupt, the same two-instruction fast interrupt as the SSI's at
-the same measured 3 cycles per word, and gives up an address register to it
-the way `r6` belongs to the SSI. See
-[`la32-budget.md`](la32-budget.md#the-transport).
+Host period words now arrive through the fast receive interrupt at P:$20,
+which owns r0 during each fixed-size upload. SSI owns r6 and uses r7 as a
+16-bit queued-word clock. HRIE is enabled before RDY and disabled before the
+final acknowledgement, so commands cannot enter the payload buffer.
+
+Foreground code extends that word clock into the 24-bit frame count, including
+periods repeated during a host stall. It services the clock while waiting for
+commands, payloads, replies and handoffs, and must do so at least once per
+16-bit word wrap (about one second). It subtracts the initial pipeline word
+and carries odd words between updates. QUERY_TIME refreshes the count before
+replying; the count can lag the wire by one frame. The normal ISR uses LUA,
+which preserves the foreground condition codes. Transport work is measured
+at 14.81 cycles/frame; receive waiting time is available for future rendering.
 
 ## Implemented
 
-Only this much runs:
+The following paths run:
 
 - two-stage DSP boot and the v1 handshake;
 - the codec transport described above, both buffers, and the handoff;
@@ -305,5 +311,7 @@ Only this much runs:
   oracle's side and the host modelled as sending a record only where a
   control moved.
 
-No MIDI, no ROM handling, no envelopes on the Falcon, and no oracle beyond
-the wave generator, the PCM partial, the reverb and the control ramps.
+The separate `MT32REND.TTP` now implements ROM-backed MIDI file rendering
+through Munt, with full envelopes, allocation and reverb, followed by file
+playback through this transport. It is offline. The assembly kernels are not
+yet integrated into a live MIDI synthesizer.

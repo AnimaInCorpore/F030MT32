@@ -63,7 +63,8 @@ NCODE ?= 2
 M68K_SOURCES := \
 	src/m68k/main.s \
 	src/m68k/dsp_link.s \
-	src/m68k/pcm_partial.s
+	src/m68k/pcm_partial.s \
+	src/m68k/pcm_file.s
 M68K_OBJECTS := $(patsubst src/m68k/%.s,$(M68K_BUILD)/%.o,$(M68K_SOURCES))
 VERBOSE_M68K_BUILD := build/m68k-verbose
 VERBOSE_M68K_OBJECTS := $(patsubst src/m68k/%.s,$(VERBOSE_M68K_BUILD)/%.o,$(M68K_SOURCES))
@@ -167,6 +168,62 @@ reference: $(TONE_TABLE) $(LA32_TABLES) $(LA32_REVERB_TABLES) $(PCM_TABLES) \
 	$(CONTROL_TABLES)
 
 oracle: $(LA32_ORACLE)
+
+# Full ROM-backed emulation is an offline renderer. Keep it separate from
+# the DSP real-time spikes so neither needs ROMs or the cross C++ compiler.
+MINT_CXX ?= m68k-atari-mintelf-g++
+MUNT_FULL_NAMES := Analog BReverbModel Display File LA32FloatWaveGenerator \
+	LA32Ramp LA32WaveGenerator MidiStreamParser Part Partial PartialManager Poly \
+	ROMInfo Synth Tables TVA TVF sha1/sha1 SampleRateConverter \
+	srchelper/InternalResampler srchelper/srctools/src/FIRResampler \
+	srchelper/srctools/src/SincResampler srchelper/srctools/src/IIR2xResampler \
+	srchelper/srctools/src/LinearResampler srchelper/srctools/src/ResamplerModel
+MUNT_FULL_SOURCES := $(addprefix $(MUNT_SRC)/,$(addsuffix .cpp,$(MUNT_FULL_NAMES)))
+RENDER_SOURCES := src/host/rom_render.cpp src/host/smf.cpp src/host/munt_tvp.cpp $(MUNT_FULL_SOURCES)
+RENDER_FLAGS := -std=c++17 -O2 -Itools/mt32emu_config -I$(MUNT_SRC) \
+	-DMT32EMU_WITH_INTERNAL_RESAMPLER=1
+
+.PHONY: renderer falcon-renderer
+renderer: $(NATIVE_BUILD)/mt32rend.exe
+falcon-renderer: $(RELEASE_DIR)/mt32rend.ttp
+
+.PHONY: check-midi
+check-midi: $(NATIVE_BUILD)/smf_dump.exe
+	python3 tools/check_midi.py
+
+$(NATIVE_BUILD)/smf_dump.exe: tools/smf_dump.cpp src/host/smf.cpp src/host/smf.h
+	@mkdir -p $(NATIVE_BUILD)
+	$(CXX) -std=c++17 -O2 tools/smf_dump.cpp src/host/smf.cpp -o $@
+
+CONTROL_ROM ?= $(ROMS_DIR)/mt32_ctrl_1_07.rom
+PCM_ROM ?= $(ROMS_DIR)/mt32_pcm.rom
+.PHONY: check-rom-renderer
+check-rom-renderer: renderer falcon-renderer tools check-midi
+	$(call require_hatari,check-rom-renderer)
+	python3 tools/check_rom_renderer.py --hatari "$(HATARI)" --tos "$(TOS_ROM)" \
+		--control "$(CONTROL_ROM)" --pcm "$(PCM_ROM)"
+
+.PHONY: check-player
+check-player: check
+	$(call require_hatari,check-player)
+	python3 tools/check_pcm_player.py --hatari "$(HATARI)" --tos "$(TOS_ROM)"
+
+$(NATIVE_BUILD)/mt32rend.exe: $(RENDER_SOURCES) $(MUNT_SRC)/TVP.cpp src/host/smf.h tools/mt32emu_config/config.h
+	@mkdir -p $(NATIVE_BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(RENDER_FLAGS) $(RENDER_SOURCES) -o $@
+
+FALCON_RENDER_OBJECTS := $(patsubst %.cpp,build/falcon-render/%.o,$(RENDER_SOURCES))
+build/falcon-render/%.o: %.cpp src/host/smf.h tools/mt32emu_config/config.h
+	@mkdir -p $(dir $@)
+	$(MINT_CXX) $(RENDER_FLAGS) -m68030 -msoft-float -c $< -o $@
+
+build/falcon-render/src/host/munt_tvp.o: $(MUNT_SRC)/TVP.cpp
+
+$(RELEASE_DIR)/mt32rend.ttp: $(FALCON_RENDER_OBJECTS)
+	@mkdir -p $(RELEASE_DIR)
+	# The toolchain's 68020-60 libraries require an FPU, even with
+	# -msoft-float. Link its base software-float libraries to our 030 objects.
+	$(MINT_CXX) -m68000 -msoft-float $(FALCON_RENDER_OBJECTS) -o $@
 
 tools: $(VASM) $(VLINK)
 
@@ -411,6 +468,7 @@ smoke: check
 	@rg -q "Direct Transfer 0x070000" build/hatari-smoke.trace   # STOP_AUDIO
 	@rg -q "XBIOS 0x89 Dsptristate\\(0x0, 0x0\\)" build/hatari-smoke.trace
 	@rg -q "XBIOS 0x81 Unlocksnd" build/hatari-smoke.trace
+	@rg -q "GEMDOS 0x00 Pterm0" build/hatari-smoke.trace
 	@! rg -q "Modulo addressing result unpredictable|Illegal instruction" \
 		build/hatari-smoke.log
 	@echo "Hatari F030MT32 boot and transport smoke test: OK"
@@ -481,6 +539,14 @@ profile-partials:
 	@for cfg in $$(seq 0 $$(( $$(python3 tools/la32_partial.py count) - 1 ))); do \
 		$(MAKE) --no-print-directory profile-partial CFG=$$cfg || exit 1; \
 	done
+
+# Long, full-scale inputs catch intermediate IntSample overflow and exercise
+# every comb beyond its first wrap, unlike the short profile fixtures.
+.PHONY: check-reverb
+check-reverb: check
+	$(call require_hatari,check-reverb)
+	python3 tools/reverb_regression.py --dosbox "$(DOSBOX)" \
+		--hatari "$(HATARI)" --tos "$(TOS_ROM)"
 
 # Cost the transport: arm the DSP profiler at a refill of the self-test's
 # host-fed stream, save it whole periods later, and sort every cycle the DSP
