@@ -41,7 +41,7 @@ LA32_PROFILE_FIRST_REVERB equ 8
 ; block-length code in bits 0-3; the last code is the adaptive stream.
 MT32_CMD_CONTROL_RUN equ    $0b0000
 MT32_CONTROL_MARKER equ     $01c300
-LA32_CONTROL_HEADER equ     22
+LA32_CONTROL_HEADER equ     24
 LA32_CONTROL_CONFIGS equ    12
 LA32_CONTROL_LENGTHS equ    5
 
@@ -51,7 +51,7 @@ LA32_CONTROL_LENGTHS equ    5
 ; render for the Hatari CPU profiler. The DSP only echoes them.
 MT32_PCM_MARKER_BEGIN equ   $01c100
 MT32_PCM_MARKER_END equ     $01c200
-PCM_PROFILE_CONFIGS equ     12
+PCM_PROFILE_CONFIGS equ     15
 PCM_PROFILE_FRAMES equ      2048
 PCM_TIMING_PERIODS equ      128
 

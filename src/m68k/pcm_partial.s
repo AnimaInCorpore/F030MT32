@@ -3,7 +3,7 @@
 ; The MT-32's PCM partials cannot run on the Falcon DSP, whose SRAM cannot
 ; hold the PCM ROM, so the plan renders them on the 68030 and streams the mix
 ; to the DSP each period (docs/architecture.md). This file measures what one
-; such partial costs: two kernels render Munt's integer PCM model into a
+; such partial costs: three kernels render Munt's integer PCM model into a
 ; stereo buffer of zero-padded 24-bit words, the format the paced host-port
 ; blast sends, with amp, pitch and pan held constant as a block-rate host
 ; would hold them between control updates.
@@ -56,7 +56,8 @@ PCM_UNLOG_ENTRIES equ   65536
 ; The signed unlog table: u[sign<<16 | log] = +/-(interpolateExp(log & 4095)
 ; >> (log >> 12)), so one indexed read does what LA32Utilites::unlog does
 ; with a shift and a sign test. Then each wave in linear form for the
-; perceptual kernel, read through that same table with no amp term.
+; perceptual kernel, read through that same table with no amp term. Include
+; the guard word after each wave, so interpolation never needs an end test.
 pcm_prepare:
         movem.l d0-d2/a0-a3,-(sp)
         lea     pcm_unlog_image,a0
@@ -79,11 +80,11 @@ pcm_prepare_frac:
 
         lea     pcm_wave_loop_image,a0
         lea     pcm_wave_loop_linear,a1
-        move.w  #PCM_WAVE_LOOP_SAMPLES-1,d2
+        move.w  #PCM_WAVE_LOOP_SAMPLES,d2
         bsr.s   pcm_linearize
         lea     pcm_wave_shot_image,a0
         lea     pcm_wave_shot_linear,a1
-        move.w  #PCM_WAVE_SHOT_SAMPLES-1,d2
+        move.w  #PCM_WAVE_SHOT_SAMPLES,d2
         bsr.s   pcm_linearize
         movem.l (sp)+,d0-d2/a0-a3
         rts
@@ -111,8 +112,14 @@ pcm_linearize_loop:
 ;   d3 length << 8                    d4 scratch     d5 = 13, the pan shift
 ;   d6 first sample                   d7 second sample, then the result
 ;   a0 wave                           a1 signed unlog table (exact)
-;   a2 output                         a3 length      a4 pan record
+;   a2 output                         a3 unused      a4 pan record
 ;   a5 end of output                  a6 configuration
+; Each wave has one guard word: its first sample if looped, silence otherwise.
+; The guard removes the neighbour-boundary branch without changing phase wrap
+; or Munt's rule that the frame ending a one-shot wave is already silent.
+; Exact configurations use the complementary MT-32 pan factors, a pair that
+; sums to 8192, or to -8192 where Munt negates both; each polarity has its
+; own copy of the exact loop.
 pcm_render:
         movem.l d1-d7/a2-a6,-(sp)
         movea.l a0,a6
@@ -124,7 +131,6 @@ pcm_render:
         move.l  pcm_position,d0
         move.l  PCM_CFG_STEP(a6),d1
         move.l  PCM_CFG_LENGTH(a6),d3
-        movea.l d3,a3
         lsl.l   #8,d3
         moveq   #13,d5
         lea     pcm_pan_record,a4
@@ -147,7 +153,13 @@ pcm_render_wave_known:
         bne.s   pcm_render_linear
         lea     pcm_unlog_signed,a1
         move.w  PCM_CFG_AMPT+2(a6),d2
-        bsr.s   pcm_exact
+        move.l  PCM_CFG_PANL(a6),d4
+        add.l   PCM_CFG_PANR(a6),d4     ; 8192, or -8192 for a pair Munt negated
+        bmi.s   pcm_render_inverted
+        bsr     pcm_exact
+        bra.s   pcm_render_done
+pcm_render_inverted:
+        bsr     pcm_exact_inverted
         bra.s   pcm_render_done
 pcm_render_linear:
         movea.l a1,a0
@@ -171,34 +183,31 @@ pcm_render_done:
 ; Exact kernel
 ; -----------------------------------------------------------------------------
 
-pcm_exact:
+; The loop is a macro so that each pan polarity gets its own copy and the
+; frame keeps no test. Munt negates both pan factors of partials 4-7 in
+; every eight when its nice partial mixing is off, as the renderer runs
+; it; the pair then sums to -8192 and the right product is
+; -(s << 13) - s*panL, one neg.l per frame more than the positive pair's
+; (s << 13) - s*panL. \1 = 1 assembles the negated pair's copy.
+        macro   pcm_exact_kernel
+pcm_exact_loop\@:
         move.l  d0,d4
         lsr.l   #8,d4                   ; sample index
         moveq   #0,d6
         move.w  (a0,d4.l*2),d6          ; first word: sign, half-log
-        addq.l  #1,d4
-        cmp.l   a3,d4
-        blo.s   pcm_exact_second
-        moveq   #0,d4                   ; past the end: wrap if looped,
-        tst.w   4(a4)                   ; otherwise the second is silence
-        bne.s   pcm_exact_second
         moveq   #0,d7
-        bra.s   pcm_exact_first
-pcm_exact_second:
-        moveq   #0,d7
-        move.w  (a0,d4.l*2),d7
+        move.w  2(a0,d4.l*2),d7         ; adjacent word, including the wave's guard sample
         add.l   d7,d7                   ; sign to bit 16, log = half-log << 1
         add.w   d2,d7                   ; + amp term, clamped at 65535
-        bcc.s   pcm_exact_second_ok
+        bcc.s   pcm_exact_second_ok\@
         or.w    #$ffff,d7
-pcm_exact_second_ok:
+pcm_exact_second_ok\@:
         move.w  (a1,d7.l*2),d7          ; signed unlog
-pcm_exact_first:
         add.l   d6,d6
         add.w   d2,d6
-        bcc.s   pcm_exact_first_ok
+        bcc.s   pcm_exact_first_ok\@
         or.w    #$ffff,d6
-pcm_exact_first_ok:
+pcm_exact_first_ok\@:
         move.w  (a1,d6.l*2),d6
         sub.w   d6,d7                   ; second - first
         moveq   #0,d4
@@ -209,21 +218,36 @@ pcm_exact_first_ok:
         add.w   d6,d7                   ; the partial's 16-bit sample
         add.l   d1,d0                   ; advance; Munt silences the frame
         cmp.l   d3,d0                   ; whose advance ends a one-shot wave
-        blo.s   pcm_exact_store
+        blo.s   pcm_exact_store\@
         tst.w   4(a4)
-        beq.s   pcm_fill_silence
+        beq     pcm_fill_silence
         sub.l   d3,d0
-pcm_exact_store:
+pcm_exact_store\@:
         move.w  d7,d4
-        muls.w  (a4),d4                 ; * left pan factor
-        asr.l   d5,d4                   ; >> 13
+        muls.w  (a4),d4                 ; unrounded left product, the pan's sign included
+; MT-32 pan factors sum to 8192 at all 15 pan positions, to -8192 for a
+; negated pair. Form the right product before either floor, so negative
+; samples and fractional products keep Munt's independent rounding:
+; s*panR = +/-(s << 13) - s*panL.
+        ext.l   d7
+        lsl.l   d5,d7
+        ifne    \1
+        neg.l   d7
+        endc
+        sub.l   d4,d7
+        asr.l   d5,d4                   ; floor left and right independently
         move.l  d4,(a2)+
-        muls.w  2(a4),d7                ; * right pan factor
         asr.l   d5,d7
         move.l  d7,(a2)+
         cmpa.l  a5,a2
-        bne     pcm_exact
+        bne     pcm_exact_loop\@
         rts
+        endm
+
+pcm_exact:
+        pcm_exact_kernel 0
+pcm_exact_inverted:
+        pcm_exact_kernel 1
 
 ; A one-shot wave ended: this frame and every later one is silence.
 pcm_fill_silence:
@@ -246,17 +270,7 @@ pcm_perceptual:
         move.l  d0,d4
         lsr.l   #8,d4
         move.w  (a0,d4.l*2),d6
-        addq.l  #1,d4
-        cmp.l   a3,d4
-        blo.s   pcm_perceptual_second
-        moveq   #0,d4
-        tst.w   4(a4)
-        bne.s   pcm_perceptual_second
-        moveq   #0,d7
-        bra.s   pcm_perceptual_mix
-pcm_perceptual_second:
-        move.w  (a0,d4.l*2),d7
-pcm_perceptual_mix:
+        move.w  2(a0,d4.l*2),d7
         sub.w   d6,d7
         moveq   #0,d4
         move.b  d0,d4
@@ -293,17 +307,7 @@ pcm_mono:
         move.l  d0,d4
         lsr.l   #8,d4
         move.w  (a0,d4.l*2),d6
-        addq.l  #1,d4
-        cmp.l   a3,d4
-        blo.s   pcm_mono_second
-        moveq   #0,d4
-        tst.w   4(a4)
-        bne.s   pcm_mono_second
-        moveq   #0,d7
-        bra.s   pcm_mono_mix
-pcm_mono_second:
-        move.w  (a0,d4.l*2),d7
-pcm_mono_mix:
+        move.w  2(a0,d4.l*2),d7
         sub.w   d6,d7
         moveq   #0,d4
         move.b  d0,d4
@@ -338,9 +342,9 @@ pcm_mono_store:
 pcm_unlog_signed:
         ds.w    2*PCM_UNLOG_ENTRIES
 pcm_wave_loop_linear:
-        ds.w    PCM_WAVE_LOOP_SAMPLES
+        ds.w    PCM_WAVE_LOOP_SAMPLES+1
 pcm_wave_shot_linear:
-        ds.w    PCM_WAVE_SHOT_SAMPLES
+        ds.w    PCM_WAVE_SHOT_SAMPLES+1
 pcm_pan_record:
         ds.w    4
 pcm_position:

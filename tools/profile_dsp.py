@@ -57,6 +57,7 @@ def write_debugger_scripts(
     end_symbol: str,
     dumps: list[tuple[str, int, int]] | None = None,
     marker_space: str = "X",
+    dump_symbol: str | None = None,
 ) -> None:
     dumps = dumps or []
     symbols = parse_listing(listing)
@@ -64,6 +65,7 @@ def write_debugger_scripts(
     profile_start = require_symbol(symbols, "P", start_symbol)
     profile_end = require_symbol(symbols, "P", end_symbol)
     last_command = require_symbol(symbols, marker_space.upper(), "last_command")
+    dump_at = require_symbol(symbols, "P", dump_symbol) if dump_symbol else None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     arm = (output_dir / "arm.ini").resolve()
@@ -81,9 +83,17 @@ def write_debugger_scripts(
         f"db pc = ${profile_end:04x} :once :trace :file {end}\n"
     )
     # The end breakpoint may also dump DSP memory, so one run both profiles
-    # a render and hands its output buffer to the oracle comparison.
+    # a render and hands its output buffer to the oracle comparison; with a
+    # dump symbol the dump waits for a later point, past work that follows
+    # the profiled window but precedes the buffer's final form.
+    dump_lines = [f"dm {space} ${first:x}-${last:x}" for space, first, last in dumps]
     end_lines = [f"dp save {profile}", "dp off"]
-    end_lines += [f"dm {space} ${first:x}-${last:x}" for space, first, last in dumps]
+    if dump_at is None:
+        end_lines += dump_lines
+    else:
+        dump = (output_dir / "dump.ini").resolve()
+        end_lines.append(f"db pc = ${dump_at:04x} :once :trace :file {dump}")
+        dump.write_text("\n".join(dump_lines) + "\n")
     end.write_text("\n".join(end_lines) + "\n")
 
 
@@ -218,6 +228,10 @@ def main() -> None:
         choices=["X", "Y", "x", "y"],
         help="memory space holding last_command, where the marker is watched",
     )
+    prepare.add_argument(
+        "--dump-symbol",
+        help="P label at which to dump memory instead of the end breakpoint",
+    )
 
     report = subparsers.add_parser("report", help="summarize a saved Hatari profile")
     report.add_argument("--listing", type=Path, required=True)
@@ -248,6 +262,7 @@ def main() -> None:
             arguments.end_symbol,
             dumps,
             arguments.marker_space,
+            arguments.dump_symbol,
         )
     else:
         summarize_profile(

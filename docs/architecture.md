@@ -150,9 +150,9 @@ limit, non-P sections, and sections outside 16-bit P memory.
 | --- | --- | --- |
 | P | `$0000-$003f` | reset and interrupt vectors |
 | P | `$0040-$007f` | reserved for the transient stage-two loader |
-| P | `$0080-$01ff` | internal: the four LA32 partial render loops, or the reverb loop in the reverb image |
+| P | `$0080-$01ff` | internal: the four LA32 partial render loops and the pan pass, or the reverb loop in the reverb image |
 | P | `$0200-$06ff` | external: command loop, transport, profile command |
-| P | `$1e40-$1fff` | transport clock and wait helpers; clear of both images� data |
+| P | `$1e40-$1fff` | transport clock and wait helpers; clear of both images' data |
 | P | `$0700-$07ff` | LA32 constant and run configuration images |
 | P | `$0800-$08ff` | test-tone table image, aliased to `Y:$0800` |
 | P | `$0900-$3bff` | LA32 Y tables — gain, resonance, windows, signed sine — aliased to the same Y addresses |
@@ -235,13 +235,14 @@ partial straddle the split. Those two cases are the reason this is a proposal
 and not a decision.
 
 Its cost is measured (`make profile-pcms`, [`la32-budget.md`](la32-budget.md#a-pcm-partial-on-the-68030)):
-one PCM partial rendered bit-exactly against Munt costs the 68030 4.67 ms
-of every 15.62 ms period, a perceptual kernel 3.89 ms, and feeding the DSP
+one PCM partial rendered bit-exactly against Munt costs the 68030 3.91 ms
+of every 15.62 ms period, a perceptual kernel 3.69 ms, and feeding the DSP
 a stereo period 2.33 ms more, so the host holds two exact or three approximate PCM partials with
-nothing else running. Three word multiplies at about 22 cycles each and two
-long stores to ST-RAM are three quarters of the kernel's 122 cycles per
-frame, which is why no cheaper renderer is in sight: the interpolation and
-the pan are what a PCM partial is.
+nothing else running. Word multiplies at about 22 cycles each, two in the
+exact kernel and three in the perceptual one, and two long stores to
+ST-RAM are more than half of their 123 and 115 cycles per frame, which is
+why no cheaper renderer is in sight: the interpolation and the pan are
+what a PCM partial is.
 
 ## Producer/consumer pipelining
 

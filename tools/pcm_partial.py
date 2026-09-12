@@ -129,6 +129,13 @@ class PCMConfig:
     pitch: int      # step in samples per frame is 2^(pitch/4096 - 5)
     level: int      # TVA ramp target; amp_for_level turns it into the amp
     pan: int        # PatchTemp panpot 0..14
+    # Partial.cpp negates both pan factors of partials 4-7 in every eight
+    # unless nice partial mixing is on, which the renderer turns off.
+    inverted: bool = False
+
+    @property
+    def polarity(self) -> int:
+        return -1 if self.inverted else 1
 
     @property
     def amp(self) -> int:
@@ -140,11 +147,11 @@ class PCMConfig:
 
     @property
     def pan_left(self) -> int:
-        return pan_factor(self.pan)
+        return self.polarity * pan_factor(self.pan)
 
     @property
     def pan_right(self) -> int:
-        return pan_factor(14 - self.pan)
+        return self.polarity * pan_factor(14 - self.pan)
 
     @property
     def length(self) -> int:
@@ -164,6 +171,8 @@ CONFIGS = [
     PCMConfig("pcm-shot-end", WAVE_SHOT, 25272, 246, 10),
     # step 0.31: each pair lasts three frames, the ladder at its coarsest
     PCMConfig("pcm-loop-deep", WAVE_LOOP, 13557, 240, 6),
+    # step 1.5 with the pan pair negated, as Munt mixes partials 4-7 of eight
+    PCMConfig("pcm-loop-inverted", WAVE_LOOP, 22876, 236, 2, True),
 ]
 KERNELS = ["exact", "perceptual", "mono"]
 
@@ -194,6 +203,8 @@ def gain_pan(tables: Tables, ampt: int, pan: int) -> int:
 
 def config_longs(tables: Tables, run: PCMRun) -> list[int]:
     c = run.config
+    if run.kernel == "exact" and c.pan_left + c.pan_right != 8192 * c.polarity:
+        raise ValueError("exact PCM requires a complementary MT-32 pan pair of one polarity")
     # The mono kernel carries the gain alone where the perceptual one carries
     # gain times pan: a DSP that pans and mixes the stream takes the pan.
     if run.kernel == "mono":
@@ -229,7 +240,11 @@ def emit_tables(tables: Tables) -> str:
     lines += dc_lines("dc.w", [tables.interpolate_exp(f) for f in range(4096)], 8)
     for index, (name, _length, _looped) in enumerate(WAVES):
         lines.append(f"pcm_wave_{name}_image:")
-        lines += dc_lines("dc.w", [rom_to_host(w) for w in wave_rom_words(index)], 8)
+        words = wave_rom_words(index)
+        # The second interpolation word is always addressable. Loop to the
+        # first sample, or supply a ROM-format zero for a one-shot wave.
+        words.append(words[0] if _looped else linear_to_rom(0))
+        lines += dc_lines("dc.w", [rom_to_host(w) for w in words], 8)
     lines.append("pcm_cfg_image:")
     for run in RUNS:
         lines.append(f"        ; {run.name}")

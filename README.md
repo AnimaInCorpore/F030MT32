@@ -19,21 +19,23 @@ The assembly code remains a set of measured synthesis kernels and a working
 transport. Live MIDI reception and real-time voice scheduling are unfinished.
 The synth-partial and reverb kernels currently occupy separate DSP images.
 
-The faithful real-time estimate is **2–4 synth partials on the DSP plus up to
-2 exact PCM partials on the 68030**, depending on waveform and control activity.
-That usually means roughly **1–3 complete multi-partial notes**, with some
-four-partial patches exceeding a resource pool even for one note. These are
-budget estimates, not a demonstrated live polyphony count.
+The faithful real-time estimate is **3-5 exact or 5-8 perceptual synth
+partials on the DSP plus up to 2 exact PCM partials on the 68030**, depending
+on waveform and control activity. That usually means roughly **2-4 complete
+multi-partial notes**, with some four-partial patches exceeding a resource
+pool even for one note. These are budget estimates, not a demonstrated live
+polyphony count.
 
-Current measurements per codec frame are 79/102 DSP cycles for an exact
-square/saw partial, 58/69 for the approximate kernels, 152 for corrected room
-reverb, and 14.81 for interrupt-driven transport. Changing controls adds up
-to about 22 cycles per partial. The total budget is 489.40. A PCM partial
-costs 4.67 ms of a 15.62 ms period bit-exact, plus 2.33 ms per mixed stereo
-upload. [The budget](docs/la32-budget.md) explains the limits and assumptions.
+Current measurements per codec frame are 72/92 DSP cycles for an exact
+square/saw partial, 44/53 for the approximate kernels plus 4 per pan bus, 83
+for bit-exact room reverb, and 14.81 for interrupt-driven transport. Changing
+controls adds up to about 22 cycles per partial. The total budget is 489.40.
+A PCM partial costs 3.91 ms of a 15.62 ms period bit-exact, plus 2.33 ms per
+mixed stereo upload. [The budget](docs/la32-budget.md) explains the limits
+and assumptions, and lists the levers still open.
 
 The hardware MT-32 has 32 **partials**, with one to four used per note, hence
-8–32 simultaneous notes. MIDI's 16 channels do not specify a polyphony limit.
+8-32 simultaneous notes. MIDI's 16 channels do not specify a polyphony limit.
 The offline renderer retains the full 32-partial pool because it does not
 have a real-time deadline.
 
@@ -186,15 +188,17 @@ The intended contracts, in the order they have to be established:
    `make profile-partials` renders four configurations with each partial
    kernel and the reverb at two settings, requires the exact kernels to
    equal Munt's output word for word and the perceptual one to stay within
-   its error bounds, and reports 77 and 100 cycles per frame for the exact
-   partial, 53 and 64 for the perceptual one, 92 for the reverb.
+   its error bounds, and reports 72 and 92 cycles per frame for the exact
+   partial, 44 and 53 for the perceptual one plus 4 per pan bus, 83 for
+   the reverb.
    `make profile-transport` measures the transport across whole host-fed
    periods: 20 cycles per frame of DSP work with the scaffold's polled
    receive, 12 with a receive by interrupt, and 59 more stalled on the
    68030 as long as the receive polls. `make profile-pcms` measures the
-   host's half: 4.67 ms per period for an exact PCM partial, 3.89 for a
-   perceptual one, 2.94 for one left unpanned for the DSP, all checked
-   against Munt from the file the program writes. `make control-sweep`
+   host's half: 3.91 ms per period for an exact PCM partial, 3.69 for a
+   perceptual one, 2.75 for one left unpanned for the DSP, all checked
+   against Munt from the file the program writes, at both polarities of
+   the pan pair. `make control-sweep`
    finds the control rate against Munt's per-sample envelopes, and
    `make profile-controls` measures the DSP deriving its constants per
    record, only what the record changed, from a host that sends one only

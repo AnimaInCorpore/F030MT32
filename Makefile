@@ -120,6 +120,8 @@ all: host dsp
 help:
 	@echo "Build targets:"
 	@echo "  all        build the Falcon executable and the DSP image"
+	@echo "  profile-ssi-dma   check DMA input and SSI output at 2, 4, 6 and 8 slots"
+	@echo "  check-pcm-math    exhaustively check exact complementary panning"
 	@echo "  check      build everything and validate the generated artefacts"
 	@echo "  smoke      run the non-interactive Hatari integration test"
 	@echo "  run        launch the self-test executable in Hatari"
@@ -496,6 +498,7 @@ profile-partial: check tools/profile_dsp.py tools/la32_partial.py
 		--marker $$((0x01c000 + $(CFG))) \
 		--start-symbol la32_$$(python3 tools/la32_partial.py loop $(CFG))_loop \
 		--end-symbol la32_$$(python3 tools/la32_partial.py loop $(CFG))_done \
+		--dump-symbol $$(python3 tools/la32_partial.py dump-symbol $(CFG)) \
 		--marker-space y --dump x:0x1000-0x1fff
 	@printf '$(CFG)' > $(RELEASE_DIR)/PROFILE.CFG
 	@cd $(RELEASE_DIR) && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(HATARI) \
@@ -669,6 +672,7 @@ profile-control: check tools/control_rate.py tools/profile_dsp.py
 		--output-dir $(CONTROL_PROFILE_RUN) \
 		--marker $$(python3 tools/control_rate.py marker $(CFG) --ncode $(NCODE)) \
 		--start-symbol la32_control_loop --end-symbol la32_control_done \
+		--dump-symbol la32_pan_done \
 		--marker-space y --dump x:0x1000-0x1fff --dump y:0x10-0x7f
 	@printf '%s' "$$(python3 tools/control_rate.py cfg $(CFG) --ncode $(NCODE))" \
 		> $(RELEASE_DIR)/PROFILE.CFG
@@ -723,3 +727,17 @@ run: all
 
 clean:
 	rm -rf build $(RELEASE_DIR)
+
+# Standalone DMA/SSI feasibility probe; its images and profiles are isolated
+# from the player and PROFILE.CFG, so it can run beside the kernel profiles.
+.PHONY: profile-ssi-dma check-pcm-math
+SSI_DMA_CHANNELS ?= 2 4 6 8
+profile-ssi-dma: tools
+	$(call require_hatari,profile-ssi-dma)
+	python3 tools/profile_ssi_dma.py --dosbox "$(DOSBOX)" --hatari "$(HATARI)" \
+		--tos "$(TOS_ROM)" --channels $(SSI_DMA_CHANNELS)
+
+check-pcm-math:
+	python3 tools/check_pcm_math.py
+
+check: check-pcm-math

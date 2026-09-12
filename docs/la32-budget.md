@@ -5,14 +5,16 @@ that decides whether it is possible: **an MT-32 has 32 partials at 32 kHz, and
 the Falcon DSP has 489 instruction cycles per output frame.** The experiments
 listed at the bottom have started, and their numbers are the headline:
 
-> **Current measured costs (2026-09-11):** 79/102 cycles per codec frame
-> for an exact square/saw partial, 58/69 for the approximate partials,
-> 152 for corrected room reverb, and 14.81 for interrupt-driven transport.
-> Control updates add up to about 22 cycles per partial per frame while
-> filters move. The resulting real-time ceiling is 2–4 exact synth partials
-> on the DSP and at most 2 exact PCM partials on the 68030, before completing
-> and measuring the live controller and combined DSP image. This is roughly
-> 1–3 typical multi-partial notes, not 32 notes or a demonstrated voice count.
+> **Current measured costs (2026-09-12):** 72/92 cycles per codec frame
+> for an exact square/saw partial, 44/53 for the approximate partials plus
+> 4 per pan bus, 83 for bit-exact room reverb, and 14.81 for
+> interrupt-driven transport. Control updates add up to about 22 cycles
+> per partial per frame while filters move. The resulting real-time
+> ceiling is 3-5 exact or 5-8 approximate synth partials on the DSP and at
+> most 2 exact PCM partials on the 68030, before completing and measuring
+> the live controller and combined DSP image. This is roughly 2-4 typical
+> multi-partial notes, not 32 notes or a demonstrated voice count. [The
+> levers still open](#the-levers-still-open) are listed at the end.
 >
 > The separate [offline renderer](falcon-renderer.md) retains Munt's full
 > 32-partial pool by rendering to disk before playback. Its short integer
@@ -50,9 +52,10 @@ ten runs into X:$1000 while Hatari's DSP profiler brackets the render loop
 between its first and last instruction: two kernels for one synth partial
 with amp, pitch and cutoff held constant, which is exactly how a block-rate
 production kernel would present them between control updates, and the Boss
-reverb over one partial's output. Each partial kernel pan-mixes into an
+reverb over one partial's output. The exact kernels pan-mix into an
 interleaved stereo accumulation buffer the way `Partial::produceAndMixSample`
-does; the reverb processes the buffer in place. A fourth probe profiles the
+does, the perceptual ones accumulate a mono bus that a pan pass mixes the
+same way afterwards; the reverb processes the buffer in place. A fourth probe profiles the
 transport itself: whole periods of the self-test's host-fed stream, with
 every cycle sorted by what the DSP was doing (`make profile-transport`).
 The fifth leaves the DSP: the 68030 renders one PCM partial, the kind of
@@ -96,8 +99,8 @@ cycle counts describe a partial that *is* the LA32 model:
 
 | Run | Cycles/frame | Instructions/frame |
 | --- | ---: | ---: |
-| square (runs 0 and 1) | 79.00 | 77 |
-| sawtooth (runs 2 and 3) | 102.00 | 100 |
+| square (runs 0 and 1) | 72.00 | 70 |
+| sawtooth (runs 2 and 3) | 92.00 | 90 |
 
 The loops are branch-free, so the cost does not depend on the parameters.
 Every instruction is a single cycle except the L read of the square's sine
@@ -106,7 +109,7 @@ DSP56001 an `(Rn+Nn)` operand costs an extra cycle and external SRAM costs
 nothing (`hatari-timing.md`, the bus probe), so every other table is
 addressed directly by its index.
 
-Per frame, square wave; the sawtooth adds 23 cycles for the cosine lookup,
+Per frame, square wave; the sawtooth adds 20 cycles for the cosine lookup,
 its two log additions and the sign flips.
 
 | Stage | Cycles | What it is |
@@ -114,18 +117,29 @@ its two log additions and the sign flips.
 | Phase advance and square-wave position | 7 | 20-bit position, one multiply for `(WP>>8)*(RWLF>>4)` |
 | Half selection | 4 | one compare, `Tcc` selects the half's record |
 | Resonance sign | 5 | bit 15 of the resonance position against the half |
-| Segment selection | 7 | two compares, `Tcc` selects rising, linear or falling table |
-| Table addresses | 9 | square sine index and resonance sine address |
+| Segment selection | 5 | two compares, `Tcc` selects rising, linear or falling table |
+| Table addresses | 8 | square sine index and resonance sine address |
 | Square log sample | 6 | sine value and window term in one L read, plus the amp term |
 | Resonance log sample | 5 | decay multiply-accumulate, sine, window |
-| Unlog, resonance | 12 | exp table by the fraction, power table by the integer part, sign |
-| Unlog, square | 13 | the same, accumulated into the sum |
-| Pan and accumulate | 9 | two multiply-accumulates into the stereo buffer |
+| Unlog, resonance | 11 | exp table by the fraction, power table by the integer part, sign |
+| Unlog, square | 12 | the same, accumulated into the sum |
+| Pan and accumulate | 7 | two multiply-accumulates into the stereo buffer, both words read before either is stored |
 | Amp ramp | 2 | present even when its slope is zero |
 
 The two unlogs are a third of the frame. That is the LA32's own structure:
 every partial produces two log-domain components, square and resonance, and
 each leaves the log domain separately.
+
+Seven cycles came off the first measurement of 79. Three left the shape
+logic: the half selection leaves the half-relative position in `b`, so
+the segment logic no longer copies it back from `y1`, and the linear
+segment's `Tcc` selects a zero position instead of the position itself,
+so the square sine index is the position shifted, with no mask, and the
+ZERO table is read at its first word only. Two left the unlogs, whose
+square log and fraction mask now ride on the resonance's two multiplies,
+and two the pan, which reads both buffer words before it stores either.
+The sawtooth lost three more by saving its logs beside the transfers that
+select its signs, 102 becoming 92.
 
 ### The perceptual kernel
 
@@ -148,10 +162,23 @@ arithmetic at all.
 
 | Run | Cycles/frame | Instructions/frame | Max error | RMS error, full scale | RMS error, signal | Correlation |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4 square-lowcut | 58.00 | 56 | 1 word | -90 dB | -62 dB | 1.000000 |
-| 5 square-pw-res | 58.00 | 56 | 2 words | -92 dB | -59 dB | 0.999999 |
-| 6 saw-maxres | 69.00 | 67 | 5 words | -87 dB | -63 dB | 1.000000 |
-| 7 saw-sinedecay | 69.00 | 67 | 2 words | -89 dB | -62 dB | 1.000000 |
+| 4 square-lowcut | 44.00 | 42 | 1 word | -90 dB | -62 dB | 1.000000 |
+| 5 square-pw-res | 44.00 | 42 | 2 words | -92 dB | -59 dB | 0.999999 |
+| 6 saw-maxres | 53.00 | 51 | 5 words | -87 dB | -63 dB | 1.000000 |
+| 7 saw-sinedecay | 53.00 | 51 | 2 words | -89 dB | -62 dB | 1.000000 |
+
+These kernels no longer pan: each accumulates its sample into a mono bus,
+one word per frame in the buffer's left slot, and `la32_pan_bus` pans the
+bus into the stereo buffer afterwards. Its four instructions measure 4.01
+cycles per frame over 2,048 frames, bracketed from `la32_pan_bus` to
+`la32_pan_done` the way each kernel is bracketed between its own loop
+labels; the cycle counts above are the kernel alone and do not include it.
+It sits in internal P beside the loops, where its fetches do not meet the
+buffer's accesses on the one external bus. With one partial on the bus the
+stereo words are the ones the kernels used to write; a part's partials
+share a pan on the MT-32, so a bus per part costs the 4 once for two to
+four partials where the kernels paid 7 each, at a rounding difference of a
+word.
 
 Full scale is 16,384, the sum of two full-amplitude components; the worse of
 the two channels is listed. The gate that `make profile-partial` applies
@@ -165,22 +192,26 @@ continuously, and Munt silences the resonance when its log sum underflows â€”
 a TVA target of 250 or more with maximum resonance â€” which the factored
 kernel does not reproduce. Neither configuration here reaches that corner.
 
-Per frame, square wave; the sawtooth adds 11 for the cosine lookup and its
+Per frame, square wave; the sawtooth adds 9 for the cosine lookup and its
 multiply.
 
 | Stage | Cycles | What it is |
 | --- | ---: | --- |
 | Phase advance and square-wave position | 7 | as the exact kernel |
 | Half selection | 4 | |
-| Segment selection | 7 | |
-| Table addresses | 9 | square sine index, signed resonance sine address |
+| Segment selection | 5 | |
+| Table addresses | 8 | square sine index, signed resonance sine address |
 | Square component | 5 | L read of sine and window, one multiply by the signed gain |
-| Resonance component | 14 | decay multiply-accumulate, window, clamp, gain lookup, multiply-accumulate |
-| Pan and accumulate | 7 | |
+| Resonance component | 9 | decay multiply-accumulate, window, the limiter's clamp, gain lookup, multiply-accumulate |
+| Bus accumulate | 1 | one add; the read and the store ride on the ramp's multiply and shift |
 | Amp ramp | 5 | present even when its slope is zero |
 
-Twenty-seven of the 58 cycles are the position, half and segment logic that
-gives the LA32 wave its shape. Anything cheaper than this stops being an LA32
+The resonance's clamp at 65535 costs nothing: its log is carried
+2^23 - 65536 above its value, so a log at or above 65536 overflows 24 bits
+and the limiter on a full-accumulator move lands it on the gain table's
+last bin, which is silence within a word (`LA32_PERC_BIAS`). Twenty-four
+of the 44 cycles are the position, half and segment logic that gives the
+LA32 wave its shape. Anything cheaper than this stops being an LA32
 partial and becomes a wavetable, which cannot follow a cutoff ramp.
 
 The perceptual kernel needs more table memory than the exact one, 13,504
@@ -206,8 +237,8 @@ Both runs equal Munt's output word for word:
 
 | Run | Cycles/frame | Instructions/frame |
 | --- | ---: | ---: |
-| 8 room, time 5, level 3 | 152.00 | 152 |
-| 9 room, time 7, level 7 | 152.00 | 152 |
+| 8 room, time 5, level 3 | 83.00 | 83 |
+| 9 room, time 7, level 7 | 83.00 | 83 |
 
 The cost does not depend on time or level, which only change factors, and
 the hall and plate modes have the same instruction count with longer lines.
@@ -215,25 +246,38 @@ The first version measured 106; folding the constant loads into free
 parallel slots, passing the link between allpasses in an accumulator, and
 forming the 1.5-weighted taps with `mac` took it to 92. That version failed
 on long, full-scale input: Munt narrows allpass links and comb inputs/stores
-to signed 16 bits, while the DSP kept 24 bits. Wrapping those intermediate
-assignments adds 60 cycles. `make check-reverb` compares all 6,144 frames of
-full-scale square, seeded noise and impulse input at both settings, including
-the first square-wave mismatch that previously occurred at frame 5,464.
-The corrected kernel passes all six cases. Per frame:
+to signed 16 bits, while the DSP kept 24 bits. Wrapping those twelve
+intermediate assignments with a mask, an exclusive-or and a subtraction
+cost 60 cycles and took the kernel to 152.
+
+The current kernel carries every sample left-justified in its 24-bit word,
+`v << 8`, and the wraps cost nothing: the 16-bit wrap Munt applies at each
+assignment is the low 24 bits of the accumulator, which every store and
+every operand read takes by themselves, and only the output's clip reads a
+whole accumulator, where it is the limiter. A product by a factor `<< 15`,
+or a half by `2^22`, then lands with its fraction in the word's low byte,
+and one `and` with `$ffff00` is the floor that Munt's `>> 8` and `>> 1`
+perform; 21 of them remain, one cycle each, against the twelve five-cycle
+wraps. The wet level is carried `<< 7` so its product lands
+right-justified, the mix buffer's form, and the input's quarters are formed
+by a multiply whose low word is the left-justified result. `make
+check-reverb` compares all 6,144 frames of full-scale square, seeded noise
+and impulse input at both settings, the cases that exercise every wrap, and
+the kernel passes all six. Per frame:
 
 | Stage | Cycles | What it is |
 | --- | ---: | --- |
-| Dry input | 9 | two quarter-scale multiplies, the sum, the dry amp |
-| Entrance delay | 5 | low-pass, amp, store, link out |
-| Allpasses | 52 | original 22 plus six signed-16-bit wraps |
-| Combs | 54 | original 24 plus six signed-16-bit wraps |
-| Left output | 15 | three taps, two 1.5 sums, clip, wet, store |
-| Right output | 17 | the same, with comb 2's second tap offset swapped in and out |
+| Dry input | 10 | two quarters, the sum, the dry amp, three floors |
+| Entrance delay | 6 | low-pass, amp, link out, two floors; its store rides on the first allpass |
+| Allpasses | 25 | eight each: two halves, two floors, the stores and the link; then the link's store for the combs |
+| Combs | 19 | six each: two multiplies, two floors, the next comb's two words read beside the add and the sub, the store on the next comb's multiply; comb 3 stores on its own |
+| Left output | 11 | three taps, two 1.5 sums, the limiter's clip, wet, store |
+| Right output | 12 | the same, with comb 2's second tap offset swapped in and out |
 
-The wraps use `(value & 0xffff) ^ 0x8000`, followed by subtracting
-0x8000. Masks live in short-addressed internal Y memory so each wrap costs
-five instructions. Saturating only the final mixer does not reproduce the
-intermediate 16-bit overflow behaviour.
+Assembled with `LA32_REVERB_PERCEPTUAL` defined, the floors are kept as
+extra precision and the six of them that carry no move of their own go;
+the kernel then differs from Munt by one word in about a fifth of the
+samples, which is why the exact form is the one built.
 
 The room mode's 10,798 words of delay line take 13,440 words of address
 space, because a modulo pointer wraps only inside a block aligned to the
@@ -320,35 +364,44 @@ to -93 dB of full scale:
 
 | Kernel | Cycles/frame | Instructions/frame | Per period | Of the 15.62 ms |
 | --- | ---: | ---: | ---: | ---: |
-| exact | 146.4 | 36 | 4.67 ms | 29.9 % |
-| perceptual | 122.0 | 26 | 3.89 ms | 24.9 % |
+| exact | 122.6 | 35 | 3.91 ms | 25.0 % |
+| exact, the negated pan pair | 126.6 | 36 | 4.04 ms | 25.9 % |
+| perceptual | 115.5 | 23 | 3.69 ms | 23.6 % |
 
-The cost is the same for every configuration to within half a cycle: the
+The cost is the same for every configuration to within a cycle: the
 kernels are branch-poor and the wave, step and amp only change which
 words they read. The program also counts the 200 Hz system tick around
 its timed render and prints it, so the same run measures itself on
-hardware; under Hatari the ticks give 4.69 and 3.91 ms per period.
+hardware; under Hatari the ticks give 3.95 and 3.71 ms per period, at
+the tick's 5 ms resolution.
 
 Per frame, exact kernel, as Hatari attributes the cycles:
 
 | Stage | Cycles | What it is |
 | --- | ---: | --- |
-| Position, sample index, two ROM words | 17 | |
+| Position, sample index, two ROM words | 14 | the second word is the neighbour, or the wave's guard word past its end |
 | Log, amp term, clamp, two unlog reads | 20 | |
-| Interpolation | 32 | factor, one word multiply, shift, add |
+| Interpolation | 33 | factor, one word multiply, shift, add |
 | Advance and wrap | 6 | |
-| Pan | 49 | two word multiplies and shifts |
-| Two stores to ST-RAM | 19 | |
-| Loop | 3 | |
+| Pan | 32 | one word multiply and shifts; the right product is the shifted sample less the left product |
+| Two stores to ST-RAM | 16 | |
+| Loop and the wrap's path | 1 | |
 
+The exact kernel pans with one word multiply, because the MT-32's pan
+factors are complementary: the pair sums to 8192, or to -8192 for the
+partials whose pair Munt negates, so the right product is the sample
+shifted by thirteen less the left product, formed before either floor
+because subtracting an already-floored left word would round differently.
+A second copy of the loop negates the shifted sample for the negated pair,
+and the fixture `pcm-loop-inverted` renders that pair through the gate.
 The perceptual kernel drops the twenty cycles of log arithmetic and
-unlogging and keeps everything else, because everything else is the
-floor: three word multiplies at about 22 cycles each are 66 of its 122
+unlogging but pays a second pan multiply, its gain-times-pan factors being
+two: three word multiplies at about 22 cycles each are 66 of its 115
 cycles, and the two long stores to ST-RAM another 19. A 16 MHz 68030 is a
 poor resampler, and the interpolation and the pan are what a PCM partial
 is. Mixing all of a part's PCM partials on one bus before panning would
-save the two pan multiplies per partial beyond the first of a part, which
-is the only lever left in the loop.
+save the pan multiplies per partial beyond the first of a part, which is
+the only lever left in the loop.
 
 Two things the emulator cannot settle. Hatari charges a word multiply 22
 cycles where the 68030 manual's cache case says 28, and the reads and
@@ -363,7 +416,7 @@ before any PCM partial is rendered.
 A third kernel measures what the host would keep if the DSP panned and
 mixed its PCM partials: the perceptual kernel without the pan, one gain
 multiply and one word per frame, the stream a DSP would take by interrupt.
-It costs 92 cycles per frame, 2.94 ms per period, within two words of
+It costs 86 cycles per frame, 2.75 ms per period, within two words of
 Munt's sample. What that buys is worked out under the levers.
 
 ### The control rate
@@ -451,9 +504,8 @@ to be copied for that, namely that a sample's pitch and cutoff reach the
 wave position one sample after its amp, so a record's position constants
 are installed after its first frame, and a record whose position
 constants did not change is rendered in one call. The ramp costs the
-kernels 2 cycles per frame in the exact ones, 77 and 100 becoming 79 and
-102, and 5 in the perceptual ones, 53 and 64 becoming 58 and 69. Per
-record, at sixteen frames:
+kernels 2 cycles per frame in the exact ones and 5 in the perceptual
+ones. Per record, at sixteen frames:
 
 | Per record, one partial | Filter moving (pluck, string, brass) | Vibrato only | Settled |
 | --- | ---: | ---: | ---: |
@@ -511,31 +563,34 @@ pitch's doing and not the amp's.
 
 ## The arithmetic that follows
 
-The total is 489.40 cycles per codec frame. Corrected room reverb and
-transport consume 152 + 14.81 = 166.81, leaving **322.59** before partial
-rendering and controls. Charging controls to each active partial gives:
+The total is 489.40 cycles per codec frame. Bit-exact room reverb and
+transport consume 83 + 14.81 = 97.81, leaving **391.59** before partial
+rendering and controls. Charging controls to each active partial, and the
+approximate kernels' pan bus at 4 cycles per two partials, gives:
 
 | Kernel | Settled square | Settled saw | Moving square (+22) | Moving saw (+22) |
 | --- | ---: | ---: | ---: | ---: |
-| Exact | 4 | 3 | 3 | 2 |
-| Approximate | 5 | 4 | 4 | 3 |
+| Exact | 5 | 4 | 4 | 3 |
+| Approximate | 8 | 7 | 5 | 5 |
 
 These are floored homogeneous partial counts, not complete-note polyphony.
 The 68030 has a separate limit: uploading the mixed period takes 2.33 ms,
 leaving at most 13.29 ms before MIDI and control work. Exact PCM takes
-4.67 ms per partial, so only **two** fit; approximate PCM at 3.89 ms permits
-three before controller overhead.
+3.91 ms per partial: three fit the arithmetic with 1.56 ms to spare, which
+is no room for MIDI and control, so **two** is the planning figure;
+approximate PCM at 3.69 ms leaves 2.2 ms with three.
 
-A faithful live implementation therefore targets **2–4 synth partials plus
-up to 2 PCM partials**, depending on waveform and envelope activity. A partial
-slot in one pool cannot pay for a partial in the other. Many factory patches
-use two to four partials, so **roughly 1–3 typical notes** is a planning range.
+A faithful live implementation therefore targets **3-5 exact or 5-8
+approximate synth partials plus up to 2 PCM partials**, depending on waveform
+and envelope activity. A partial slot in one pool cannot pay for a partial in
+the other. Many factory patches use two to four partials, so **roughly 2-4
+typical notes** is a planning range.
 One-partial square patches can exceed that; a four-saw patch exceeds the
 attack budget even for one complete note. Ring modulation, combined memory
 layout and the live controller still need implementation and measurement.
 
 The offline renderer has no per-frame deadline and can retain the normal
-MT-32 **32 partials**, or 8–32 notes according to patch structure. Its ability
+MT-32 **32 partials**, or 8-32 notes according to patch structure. Its ability
 to render does not establish real-time feasibility.
 
 ## Earlier optimisation analysis (historical budgets)
@@ -560,7 +615,7 @@ the starting condition, and the partial itself is close to its floor.
    and the host at about 90 % with three PCM partials and the transport,
    before MIDI, envelopes and allocation; neither has idle time to give
    the other. The one exchange that pays is the PCM partials' pan and mix:
-   rendered mono on the host they cost 2.94 ms instead of 3.89, and a DSP
+   rendered mono on the host they cost 2.75 ms instead of 3.69, and a DSP
    that takes each partial as its own 512-word stream pans and mixes it for
    6 cycles per frame â€” the 3 of the receive interrupt, a read and two
    multiply-accumulates â€” where the host paid 47 for two multiplies and 9
@@ -570,10 +625,10 @@ the starting condition, and the partial itself is close to its floor.
 
    | Design | Host time for N PCM partials | N that fits 15.62 ms | DSP cycles per frame |
    | --- | --- | ---: | ---: |
-   | stereo mix on the host | 2.33 + 3.89 N | 3.4 | 0 |
-   | mono streams, DSP pans, paced | 4.10 N | 3.8 | 6 N |
-   | mono streams, DSP pans, blind | 3.71 N | 4.2 | 6 N |
-   | one mono bus per part, DSP pans, blind | 2.94 N + 0.77 parts | 4.4 at three parts | 6 parts |
+   | stereo mix on the host | 2.33 + 3.69 N | 3.6 | 0 |
+   | mono streams, DSP pans, paced | 3.91 N | 4.0 | 6 N |
+   | mono streams, DSP pans, blind | 3.55 N | 4.4 | 6 N |
+   | one mono bus per part, DSP pans, blind | 2.75 N + 0.77 parts | 4.8 at three parts | 6 parts |
 
    One PCM partial more on the host for about a quarter of a synth
    partial on the DSP, which is worth it only because the PCM side is the
@@ -581,12 +636,11 @@ the starting condition, and the partial itself is close to its floor.
    the ROM, the envelopes need the timbre and the note, and the polled
    receive's 59 cycles of waiting are not idle time to spend but a cost the
    interrupt receive removes.
-3. **A cheaper reverb.** The reverb is now the largest single item after the
-   partials themselves. Its clip, its dry and wet scalings and its exact
-   floors are the price of matching Munt word for word; a perceptual reverb
-   with the same delay lines could drop the clip and merge the scalings for
-   perhaps ten to fifteen cycles, and running it at half rate is worth an
-   experiment against the oracle before it is ruled out.
+3. **A cheaper reverb.** Done, and still exact: carrying the samples
+   left-justified made the twelve 16-bit wraps free and took the reverb from
+   152 cycles to 83, the limiter took over the clip, and a perceptual form
+   that keeps the floors' fractions drops six more. Running it at half rate is
+   still worth an experiment against the oracle before it is ruled out.
 4. **A lower internal rate.** Prescale 3 gives 24,584.96 Hz and 652.5
    cycles per frame, one third more partials for the top octave. Last
    resort, and it interacts badly with comparing against an oracle.
@@ -606,16 +660,68 @@ absolute one: 262,144 samples against 32,768 words of SRAM.
 
 ## Reproducible gates and remaining integration
 
-- `make profile-partials`: exact 79/102, approximate 58/69, room reverb 152.
+- `make profile-partials`: exact 72/92, approximate 44/53, room reverb 83; the
+  pan bus's 4.01 cycles are bracketed separately and are not in those figures.
 - `make check-reverb`: six long overflow regressions against Munt.
 - `make profile-transport`: 14.81 cycles/frame, verified interrupt word count.
-- `make profile-pcms`: 4.67 ms exact and 3.89 ms approximate PCM per period.
+- `make profile-pcms`: 3.91 ms exact, 4.04 for the negated pan pair, 3.69 ms
+  approximate and 2.75 ms mono PCM per period, fifteen runs.
 - `make control-sweep` and `make profile-controls`: held-control error and
   per-record cost, with per-sample amp ramps.
 - `make check-rom-renderer`: complete short ROM/MIDI renders on a 4 MiB
   FPU-less Falcon, compared with the workstation.
 - `make check-player`: every file sample uploaded correctly, cache refills,
   final-period draining, and invalid-file rejection.
+
+## The levers still open
+
+What the measurements above leave on the table, in the order of what each
+is worth, with the figures that back the estimate. None of these is
+measured; each names the gate that would measure it.
+
+1. **Gain, ramp and pan of the PCM streams on the DSP.** The host's
+   perceptual PCM kernel spends 22 of its 115 cycles per frame on the gain
+   multiply and 47 on the two pan multiplies, and it cannot ramp a linear
+   gain per frame without a multiply, where the control-rate sweep says the
+   amp must move every frame. A mono kernel that only interpolates costs
+   about 64 cycles per frame, 2.0 ms per period against 3.7, and the DSP
+   applies gain, its per-frame ramp and the pan the way the synth kernels
+   do, for about 10 cycles per stream per frame. That is one PCM partial
+   more on the 68030 for a fifth of a synth partial on the DSP, and the
+   amp moves every frame, as the control-rate sweep requires, by the same
+   ramp the perceptual synth kernels carry. Gate: `make profile-pcms` for
+   the host half, a stream variant of `MT32_CMD_CONTROL_RUN` for the DSP
+   half.
+2. **Feed the PCM streams through the sound DMA instead of the host port.**
+   The crossbar routes DMA playback to the DSP's SSI receive, in lockstep
+   with its transmit, and a `Settracks` of up to four stereo tracks carries
+   eight words per frame; Hatari's crossbar models both. The 68030 then
+   writes 16-bit words into ST-RAM the DMA reads, instead of pacing 24-bit
+   words through the host port at 1.16 ms per mono stream and period, and
+   the DSP takes each word in a fast interrupt for about 4 cycles, as the
+   transmit already does. The whole 2.33 ms upload leaves the host's period.
+   The path has not been driven on hardware by this project; the bus probe
+   and the smoke gate are the places to start.
+3. **A half-rate reverb.** The reverb is a fixed 83 cycles at the codec
+   rate. Averaging input pairs, running the network at half the rate with
+   halved lines and repeating or interpolating the output would cost about
+   45, one approximate partial back, at the price of the reverb's top
+   octave, which the room mode's entrance low-pass and comb filters already
+   attenuate. Not gradable word for word; a spectral comparison against the
+   oracle at both settings is the gate.
+4. **A cheaper control derivation.** A record that moves the cutoff costs
+   250 to 330 cycles, about 130 of them the cutoff's two exponent lookups,
+   the segment lengths and the two log terms, and about 40 in long-addressed
+   loads and two-word immediates a tighter register allocation would shave.
+   Worth 2 to 3 cycles per moving partial per frame. Gate: `make
+   profile-controls`.
+5. **A first-partial store.** The first partial on a bus could store instead
+   of accumulating, one read fewer per frame, at the cost of a second entry
+   point in internal P, which has 73 words left.
+6. **The transport's receive.** Six cycles per frame while the host uploads
+   over the host port; lever 2 removes them with the upload.
+7. **Prescale 3.** 24,585 Hz gives 652 cycles per frame, a third more
+   partials, and moves every comparison against the oracle. Last resort.
 
 The live synth still needs a combined memory layout, scheduling, ring-pair
 integration, control delivery and MIDI reception. The current full-fidelity

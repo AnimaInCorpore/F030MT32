@@ -44,10 +44,15 @@
 LA32_UNLOG_X        equ     $0000
 LA32_UNLOG_IMAGE_P  equ     $4000
 LA32_UNLOG_COPY     equ     256
-LA32_CONST_WORDS    equ     21
-LA32_CONFIG_WORDS   equ     18
+LA32_CONST_WORDS    equ     20
+LA32_CONFIG_WORDS   equ     20
 LA32_OUTPUT_BASE    equ     $1000
 LA32_OUTPUT_WORDS   equ     2*LA32_PROFILE_FRAMES
+; The perceptual kernels carry their resonance log 2^23 - 65536 above its
+; value, so Munt's clamp at 65535 is the limiter on a full-accumulator
+; move: a log at or above 65536 saturates to $7fffff, the gain table's
+; last bin, which is silence within a word. tools/la32_partial.py mirrors it.
+LA32_PERC_BIAS      equ     $7f0000
 
 ; The regression image fills all of the free external X bank. Production
 ; profiles retain their original size; both use the same reverb loop.
@@ -57,15 +62,26 @@ LA32_REVERB_FRAMES  equ     6144
 LA32_REVERB_FRAMES  equ     LA32_PROFILE_FRAMES
         ENDIF
 
-; Munt's integer delay network narrows at each IntSample assignment. Its
-; final mixer saturates, but intermediate additions wrap to signed 16 bits.
-; Scratch registers must not contain a live tap or feedback coefficient.
-rv_wrap16 macro acc,maskreg,signreg
-        move    y:<rv_wordmask,maskreg
-        move    y:<rv_sign16,signreg
-        and     maskreg,acc
-        eor     signreg,acc
-        sub     signreg,acc
+; The reverb keeps every 16-bit sample left-justified in its 24-bit word,
+; so the wrap Munt applies at each IntSample assignment is the low 24 bits
+; of the accumulator, which every store and every operand read takes for
+; free. What remains of the exact arithmetic is the floor: a product or a
+; half lands with its fraction in the word's low byte, and one AND drops it.
+; Assembled with LA32_REVERB_PERCEPTUAL defined, the floors are kept as
+; extra precision instead and the ANDs go; the parallel move stays.
+rv_floor macro acc
+        IF      @DEF(LA32_REVERB_PERCEPTUAL)
+        ELSE
+        and     y1,acc
+        ENDIF
+        endm
+
+rv_floorm macro acc,src,dst
+        IF      @DEF(LA32_REVERB_PERCEPTUAL)
+        move    src,dst
+        ELSE
+        and     y1,acc    src,dst
+        ENDIF
         endm
 
 ; Boss reverb, MT-32 room mode: delay-line homes in Y (mirrored by the
@@ -159,22 +175,23 @@ rv_fb1          ds      1               ; comb feedback factors << 15
 rv_fb2          ds      1
 rv_fb3          ds      1
 rv_dry          ds      1               ; dry amp << 15
-rv_wet          ds      1               ; wet level << 15
+rv_wet7         ds      1               ; wet level << 7: leaves the output right-justified
 rv_ffent        ds      1               ; entrance low-pass factor << 15
 rv_lpf          ds      1               ; entrance output amp << 15
 rv_kernel       ds      1               ; 2
 rv_ffc          ds      1               ; comb filter factor << 15
 rv_n5l          ds      1               ; comb 2 left tap offset
 rv_n5r          ds      1               ; comb 2 right tap offset
-rv_max          ds      1               ; 32767
-rv_min          ds      1               ; -32768
-rv_quarter      ds      1               ; 2^21: mpy by it is a right shift by 2
+rv_mask         ds      1               ; $ffff00: the floor to whole 16-bit words
+rv_in5          ds      1               ; 2^5: mpy by it puts the input's quarter in a0, left-justified
+rv_quarter      ds      1               ; 2^21, unused
 rv_half         ds      1               ; 2^22: mpy by it is a right shift by 1
-rv_pad          ds      2
+rv_link         ds      1               ; scratch: the link into the combs
+rv_pad          ds      1
 rv_outl1        ds      1               ; scratch: comb 1's oldest word
 rv_outr3        ds      1               ; scratch: comb 3's last word
-rv_wordmask     ds      1               ; $ffff: intermediate IntSample wrapping
-rv_sign16       ds      1               ; $8000: convert unsigned 16 to signed
+rv_spare        ds      2               ; past the 20-word configuration block, whose
+                                        ; last two words land on the scratch taps above
 
         ELSE
 
@@ -199,7 +216,7 @@ la_cut_res      ds      1               ; ras + the cutoff's resonance term - 40
 la_wp3          ds      1               ; wave position << 3, advanced per frame
 la_wphmask      ds      1               ; $7ff800 - first fixed word
 la_sh5          ds      1               ; 2^18: mpy by it is a right shift by 5
-la_m511         ds      1
+la_zero         ds      1               ; 0: the linear segment's sine position
 la_m7fe0        ds      1               ; R4 bits 5-14: the exact resonance index
 la_sh12         ds      1               ; 2^11: mpy by it is a right shift by 12
 la_m4095        ds      1
@@ -214,29 +231,33 @@ la_shtab        ds      1               ; exact power table entry for integer pa
 la_rtab         ds      1               ; exact resonance log sine table
 la_mffe0        ds      1               ; R4 bits 5-15: the perceptual signed index
 la_sh4          ds      1               ; 2^19: mpy by it is a right shift by 4
-la_m65535       ds      1
-la_gtab         ds      1               ; perceptual gain table entry for a zero argument
+la_gtabb        ds      1               ; the gain table's zero-argument entry less
+                                        ; LA32_PERC_BIAS >> 4; the block derivation
+                                        ; reads it, the kernels take it from the record
 la_ctab         ds      1               ; perceptual signed cosine table
 la_mcos11       ds      1               ; $7ff000: perceptual cosine index bits - last fixed word
 la_sqlog        ds      1               ; scratch: square log sample
 la_rmul         ds      1               ; scratch: resonance sign multiplier
-la_rlog         ds      1               ; scratch
 la_frames       ds      1               ; frames per kernel call: a run or a block
 la_blocks       ds      1               ; blocks in a control run
 la_step3        ds      1               ; configuration: sampleStep << 3
 la_k7           ds      1               ; (resonanceWaveLengthFactor >> 4) << 7
 la_b3           ds      1               ; start of the negative half, S4 units
 la_ampt         ds      1               ; amp>>10 plus the low-cutoff square term
-la_rbase        ds      1               ; amp>>10 + resonance amp subtraction + cutoff term - 4096
+la_rbase        ds      1               ; amp>>10 + resonance amp subtraction + cutoff term - 4096;
+                                        ; plus LA32_PERC_BIAS in the perceptual kernels
 la_panl         ds      1               ; pan factors, << 9 exact, << 10 perceptual
 la_panr         ds      1
 la_saw          ds      1               ; nonzero selects a sawtooth loop
 la_kernel       ds      1               ; 0 exact, 1 perceptual
 la_sqbase       ds      1               ; the kernel's FWD square table; ZERO and REV follow
-la_half0        ds      4               ; per half, exact: sign base, linear length,
-la_half1        ds      4               ;   decay << 15, square sign multiplier;
+la_half0        ds      5               ; per half, exact: sign base, linear length,
+la_half1        ds      5               ;   decay << 15, square sign multiplier, pad;
                                         ; perceptual: linear length, sine table base,
-                                        ;   decay << 15, signed square gain
+                                        ;   decay << 15, signed square gain, the gain
+                                        ;   table base - the last word costs the
+                                        ;   kernels nothing, where a short-address
+                                        ;   load of it cost an instruction
 la_entry        ds      1               ; control run: the kernel entry
 la_rest         ds      1               ; control run: block length - 1
 la_poschg       ds      1               ; control run: the position constants changed
@@ -321,131 +342,132 @@ ssi_buffer_b:
 ; their next slot, r4/r5/r7 combs at their index, r6 the in-place stereo
 ; buffer. The tap reads use post-update addressing twice - forward by the
 ; offset and back - so they cost plain moves rather than indexed ones; comb
-; 2 has two taps and reloads n5 between them. weirdMul is a fractional
-; multiply by the factor << 15 and halving one by 2^22, both exact floors.
+; 2 has two taps and reloads n5 between them.
+;
+; Every sample is carried left-justified, v << 8, so the multiply by a
+; factor << 15 gives v * factor in the word with the low byte the
+; fraction, halving by 2^22 likewise, and one AND with $ffff00 (y1 for the
+; whole frame) is the floor Munt's >> 8 and >> 1 perform. The 16-bit wrap
+; Munt applies at every IntSample assignment is the low 24 bits, which the
+; stores and operand reads take by themselves; only the output's clip
+; reads a whole accumulator, and that is the limiter. The wet level is
+; carried << 7 so its product lands right-justified, the buffer's form.
 
         org     p:$80
 
 la32_reverb_run:
         move    #>LA32_REVERB_FRAMES,x0
+; the floor mask and the input's quarter shift hold for every frame, so they
+; are loaded once here; the loop reloads only the quarter, which its last
+; multiply carries
+        move    y:<rv_mask,y1
+        move    y:<rv_in5,y0
         do      x0,la32_reverb_done
 la32_reverb_loop:
-; dry input
-        move    y:<rv_quarter,y0
+; dry input: (inL >> 2) + (inR >> 2), each floored, times the dry amp. The
+; buffer's words are right-justified: multiplied by 2^5, the left-justified
+; quarter lands in the accumulator's low word.
         move    x:(r6)+,x0                  ; left
-        mpy     x0,y0,a   x:(r6)-,x1        ; a1 = left >> 2; x1 = right; r6 back to the left slot
-        mpy     x1,y0,b   y:<rv_dry,y1      ; b1 = right >> 2
+        mpy     x0,y0,a   x:(r6)-,x1        ; a0 = left << 6; x1 = right; r6 back to the left slot
+        mpy     x1,y0,b   a0,a              ; b0 = right << 6; a = the left quarter
+        rv_floorm a,b0,b                     ; floor it; b = the right quarter
+        rv_floorm b,y:<rv_dry,y0
+        add     b,a
         move    a1,x0
-        add     x0,b      y:<rv_ffent,y0
-        move    b1,x0
-        mpy     x0,y1,a   y:(r0)+,x0        ; a1 = dry; x0 = entrance last; r0 -> oldest
-        move    a1,y1                       ; y1 = dry
+        mpy     x0,y0,a   y:(r0)+,x0        ; a1 = dry * amp; x0 = entrance last; r0 -> oldest
+        rv_floorm a,y:<rv_ffent,y0
+        move    a1,x1                       ; x1 = dry
 ; entrance delay with its low-pass filter; the oldest word is the link
-        mpy     x0,y0,a   y:(r0),x1         ; a1 = last * $b0 >> 8; x1 = link
-        add     y1,a      y:<rv_lpf,y0
+        mpy     x0,y0,a   y:(r0),b          ; a1 = last * $b0; b = link
+        rv_floorm a,y:<rv_lpf,y0
+        add     x1,a                        ; a = lpfOut
         move    a1,x0
-        mpy     x0,y0,a   y:<rv_half,y0     ; a1 = new; y0 = half for the allpasses
-        move    a1,y:(r0)
-; allpass 0; the link travels in a from one allpass to the next
-        tfr     x1,b      y:(r1),x0         ; b = link; x0 = oldest
-        mpy     x0,y0,a                     ; a1 = oldest >> 1
-        move    a1,y1
-        sub     y1,b                        ; b1 = new
-        rv_wrap16 b,x1,y1
-        move    b1,x1
-        mpy     x1,y0,a   b1,y:(r1)+        ; a1 = new >> 1; store, advance
-        add     x0,a                        ; a1 = link
-        rv_wrap16 a,x1,y1
+        mpy     x0,y0,a   y:<rv_half,y0     ; a1 = lpfOut / 2; y0 = half for the allpasses
+        rv_floorm a,y:(r1),x1               ; x1 = allpass 0's oldest
+; allpasses: the link travels in b. new = link - oldest / 2 is stored, and
+; oldest + new / 2 links on; the stores and operand reads wrap both. The
+; entrance's own store rides on the first half, which carries nothing
+        mpy     x1,y0,a   a1,y:(r0)         ; a1 = oldest / 2; store the lpf output
+        rv_floor a
+        sub     a,b                         ; b = new
+        move    b1,x0
+        mpy     x0,y0,a   b1,y:(r1)+        ; a1 = new / 2; store new, advance
+        rv_floor a
+        tfr     x1,b
+        add     a,b       y:(r2),x1         ; b = link; x1 = allpass 1's oldest
 ; allpass 1
-        tfr     a,b       y:(r2),x0
-        mpy     x0,y0,a
-        move    a1,y1
-        sub     y1,b
-        rv_wrap16 b,x1,y1
-        move    b1,x1
-        mpy     x1,y0,a   b1,y:(r2)+
-        add     x0,a
-        rv_wrap16 a,x1,y1
-; allpass 2; the first comb's feedback factor rides on its last add
-        tfr     a,b       y:(r3),x0
-        mpy     x0,y0,a
-        move    a1,y1
-        sub     y1,b
-        rv_wrap16 b,x1,y1
-        move    b1,x1
-        mpy     x1,y0,a   b1,y:(r3)+
-        add     x0,a      y:<rv_fb1,y0
-        rv_wrap16 a,x1,y1
-        move    a1,x1                       ; x1 = link into the combs
-; comb 1; its oldest word is the first left tap
-        move    y:(r4)+,x0                  ; last; r4 -> oldest
-        move    y:(r4),y1                   ; oldest
-        mpy     y1,y0,a   y:<rv_ffc,y0      ; a1 = oldest * feedback >> 8
-        add     x1,a      y1,y:<rv_outl1    ; a1 = filter input; keep the tap
-        mpy     x0,y0,b   y:<rv_fb2,y0      ; b1 = last * $60 >> 8; next feedback
-        rv_wrap16 a,x0,y1
-        move    a1,y1
-        sub     y1,b                        ; b1 = new
-        rv_wrap16 b,x0,y1
-        move    b1,y:(r4)                   ; store at the new index
+        mpy     x1,y0,a
+        rv_floor a
+        sub     a,b
+        move    b1,x0
+        mpy     x0,y0,a   b1,y:(r2)+
+        rv_floor a
+        tfr     x1,b
+        add     a,b       y:(r3),x1
+; allpass 2; comb 1's feedback factor and its two words follow
+        mpy     x1,y0,a
+        rv_floor a
+        sub     a,b
+        move    b1,x0
+        mpy     x0,y0,a   b1,y:(r3)+
+        rv_floorm a,y:<rv_fb1,y0
+        tfr     x1,b      y:(r4)+,x0        ; b = allpass 2's oldest; x0 = comb 1 last
+        add     a,b       y:(r4),x1         ; b = link into the combs; x1 = comb 1's oldest
+        move    b1,y:<rv_link
+; comb 1: new = last * $60 / 256 - (link + oldest * feedback / 256); its
+; oldest word is the first left tap
+        mpy     x1,y0,a   x1,y:<rv_outl1    ; a1 = oldest * feedback; keep the tap
+        rv_floorm a,y:<rv_ffc,y0
+        mpy     x0,y0,b   y:<rv_link,x0     ; b1 = last * $60; x0 = link
+        rv_floorm b,y:<rv_fb2,y0
+; each comb reads the next one's last and oldest words in the add and the sub
+; that finish it, and its own store rides on the multiply that opens the next,
+; so a comb costs six instructions instead of eight
+        add     x0,a      y:(r5)+,x1        ; a = filter input; x1 = comb 2 last
+        sub     a,b       y:(r5),x0         ; b = new; x0 = comb 2's oldest
 ; comb 2
-        move    y:(r5)+,x0
-        move    y:(r5),y1
-        mpy     y1,y0,a   y:<rv_ffc,y0
-        add     x1,a
-        mpy     x0,y0,b   y:<rv_fb3,y0
-        rv_wrap16 a,x0,y1
-        move    a1,y1
-        sub     y1,b
-        rv_wrap16 b,x0,y1
-        move    b1,y:(r5)
+        mpy     x0,y0,a   b1,y:(r4)         ; store comb 1 at its new index
+        rv_floorm a,y:<rv_ffc,y0
+        mpy     x1,y0,b   y:<rv_link,x0
+        rv_floorm b,y:<rv_fb3,y0
+        add     x0,a      y:(r7)+,x1        ; x1 = comb 3 last; r7 -> oldest
+        sub     a,b       y:(r7),x0         ; x0 = comb 3's oldest
 ; comb 3; its last word is the third right tap, and half is next
-        move    y:(r7)+,x0
-        move    y:(r7),y1
-        mpy     y1,y0,a   y:<rv_ffc,y0
-        add     x1,a      x0,y:<rv_outr3
-        mpy     x0,y0,b   y:<rv_half,y0
-        rv_wrap16 a,x0,y1
-        move    a1,y1
-        sub     y1,b
-        rv_wrap16 b,x0,y1
+        mpy     x0,y0,a   b1,y:(r5)         ; store comb 2
+        rv_floorm a,y:<rv_ffc,y0
+        mpy     x1,y0,b   y:<rv_link,x0
+        rv_floorm b,y:<rv_half,y0
+        add     x0,a      x1,y:<rv_outr3    ; keep comb 3's last word as the tap
+        sub     a,b       y:<rv_outl1,x0    ; b = new; x0 = left tap 1
         move    b1,y:(r7)
 ; left output: 1.5 * comb 1's oldest + 1.5 * comb 2's tap + comb 3's tap,
-; clipped and scaled by the wet level. A tap is read by stepping the comb's
-; pointer forward by the offset and back, two plain moves that ride on the
-; transfers and multiply-accumulates of the mix.
-        move    y:<rv_outl1,x0
-        tfr     x0,a      y:(r5)+n5,x1      ; a = tap 1; comb 2 to its left tap
-        mac     x0,y0,a   y:(r5)-n5,x1      ; a1 = tap 1 + tap 1 >> 1; x1 = tap 2; back
-        tfr     x1,b      y:(r7)+n7,y1      ; b = tap 2; comb 3 to its left tap
-        mac     x1,y0,b   y:(r7)-n7,y1      ; b1 = tap 2 + tap 2 >> 1; y1 = tap 3; back
-        move    b1,x1
-        add     x1,a      y:<rv_max,x0
-        add     y1,a      y:<rv_min,x1
-        cmp     x0,a
-        tgt     x0,a
-        cmp     x1,a      y:<rv_wet,y1
-        tlt     x1,a
-        move    a1,x0
-        mpy     x0,y1,a   y:(r4)+n4,x1      ; a1 = wet left; comb 1 to its right tap
+; clipped by the limiter and scaled by the wet level. A tap is read by
+; stepping the comb's pointer forward by the offset and back, two moves
+; that ride on the arithmetic.
+        mpy     x0,y0,a   y:(r5)+n5,x1      ; a1 = tap 1 / 2; comb 2 to its left tap
+        rv_floorm a,y:(r5)-n5,x1            ; x1 = tap 2; back
+        add     x0,a      y:(r7)+n7,x0      ; a = 1.5 * tap 1; comb 3 to its left tap
+        mpy     x1,y0,b   y:(r7)-n7,x0      ; b1 = tap 2 / 2; x0 = tap 3; back
+        rv_floorm b,y:<rv_n5r,n5            ; n5 = comb 2's right tap offset, for below
+        add     x1,b                        ; b = 1.5 * tap 2
+        add     b,a
+        add     x0,a      y:<rv_wet7,x1     ; a = the sum
+        move    a,x0                        ; limited: the clip
+        mpy     x0,x1,a   y:(r4)+n4,x1      ; a1 = wet left, right-justified; comb 1 to its right tap
         move    a1,x:(r6)+                  ; over the input
-; right output: comb 1's tap, comb 2's second tap, comb 3's last word
+; right output: comb 1's tap, comb 2's second tap, comb 3's last word; n5
+; already carries comb 2's right offset, loaded beside the left channel's floor
         move    y:(r4)-n4,x0                ; x0 = tap 1; back
-        move    y:<rv_n5r,n5
-        tfr     x0,a      y:<rv_outr3,y1    ; a = tap 1; y1 = tap 3
-        mac     x0,y0,a   y:(r5)+n5,x1      ; a1 = 1.5 * tap 1; comb 2 to its right tap
-        move    y:(r5)-n5,x1                ; x1 = tap 2; back
-        tfr     x1,b      y:<rv_n5l,n5      ; b = tap 2; the left offset again
-        mac     x1,y0,b                     ; b1 = 1.5 * tap 2
-        move    b1,x1
-        add     x1,a      y:<rv_max,x0
-        add     y1,a      y:<rv_min,x1
-        cmp     x0,a
-        tgt     x0,a
-        cmp     x1,a      y:<rv_wet,y1
-        tlt     x1,a
-        move    a1,x0
-        mpy     x0,y1,a
+        mpy     x0,y0,a   y:(r5)+n5,x1      ; comb 2 to its right tap
+        rv_floorm a,y:(r5)-n5,x1            ; x1 = tap 2; back
+        add     x0,a      y:<rv_n5l,n5      ; the left offset again
+        mpy     x1,y0,b   y:<rv_outr3,x0    ; x0 = tap 3
+        rv_floor b
+        add     x1,b
+        add     b,a
+        add     x0,a      y:<rv_wet7,x1
+        move    a,x0
+        mpy     x0,x1,a   y:<rv_in5,y0      ; y0 = the quarter shift for the next frame
         move    a1,x:(r6)+                  ; wet right over the input
 la32_reverb_done:
         rts
@@ -510,29 +532,28 @@ la32_square_loop:
         move    a1,x0
         mpy     x0,y0,a y:<la_b3,x0
         asl     a       y:<la_rec1,r1    ; a1 = S4; r1 = half 1 record
-; half: b = R4, r1 = that half's record
+; half: b = R4, r1 = that half's record; the rising segment's table is the
+; one free register move in the half's arithmetic
         tfr     a,b     y:<la_sh7,x1
-        sub     x0,b
+        sub     x0,b    r4,r2            ; r2 = FWD until a segment test moves it
         tlt     a,b     r3,r1
         move    b1,y1                    ; y1 = R4
 ; resonance sign multiplier: sign base ^ ((R4 & $8000) << 8)
         mpy     y1,x1,a y:<la_sgnbit,x1  ; a0 = R4 << 8
-        move    a0,b
-        and     x1,b    y:(r1)+,x0       ; x0 = sign base; r1 -> linear length
-        eor     x0,b
-        move    b1,y:<la_rmul
-; segment within the half: a = position inside a sine segment, r2 = table
-        move    r4,r2
-        tfr     y1,b    y:<la_2p14,x0
-        tfr     y1,a    y:(r1)+,x1       ; x1 = linear length; r1 -> decay
-        sub     x0,b    y:<la_sh5,y0
-        tge     b,a     r5,r2
-        sub     x1,b
+        move    a0,a
+        and     x1,a    y:(r1)+,x0       ; x0 = sign base; r1 -> linear length
+        eor     x0,a    y:(r1)+,x1       ; x1 = linear length; r1 -> decay
+        move    a1,y:<la_rmul
+; segment within the half: a = position inside a sine segment - zero in the
+; linear segment, so its index needs no mask - r2 = table; b still holds R4
+        tfr     b,a     y:<la_2p14,x0
+        sub     x0,b    y:<la_zero,y0
+        tge     y0,a    r5,r2
+        sub     x1,b    y:<la_sh5,y0
         tge     b,a     r7,r2
 ; table addresses: n2 = square sine index, r0 = resonance sine; x0 = R4
         move    a1,x0
-        mpy     x0,y0,a y:<la_m511,x1
-        and     x1,a    y1,x0            ; a1 = square index; x0 = R4
+        mpy     x0,y0,a y1,x0            ; a1 = square index; x0 = R4
         move    a1,n2
         tfr     y1,b    y:<la_m7fe0,x1
         and     x1,b    y:<la_rtab,a     ; b1 = R4 & $7fe0; a1 = table base
@@ -562,12 +583,11 @@ la32_square_loop:
         move    a1,r2
         move    y:<la_rmul,y0
         move    x:(r2),x1                ; 2^(15 - integer part), or 0
-        mpy     x0,x1,a                  ; a1 = magnitude
+        mpy     x0,x1,a y:<la_m4095,x1   ; a1 = magnitude; x1 = the fraction mask
         move    a1,x0
-        mpy     x0,y0,b
-; unlog the square, accumulating into b
-        move    y:<la_sqlog,a
-        move    y:<la_m4095,x1
+; unlog the square, accumulating into b; its log and the fraction mask ride
+; on the resonance's two multiplies, which carry nothing of their own
+        mpy     x0,y0,b y:<la_sqlog,a
         and     x1,a    y:<la_sqlog,x0
         move    a1,r1
         move    y:<la_sh12,y0
@@ -579,16 +599,17 @@ la32_square_loop:
         mpy     x0,x1,a
         move    a1,x0
         mac     x0,y1,b                  ; b = (+/-m_sq +/- m_res) * 2^23
-; pan into the interleaved accumulation buffer; reload the step for the next frame
-        asl     b
+; pan into the interleaved accumulation buffer; reload the step for the next
+; frame. Both words are read before either is stored, so the reads ride on a
+; shift and on the left channel's own multiply-accumulate, and the right
+; channel accumulates in b
+        asl     b       x:(r6)+,a        ; a = the left word; r6 -> right
         asl     b       y:<la_panr,y1    ; b1 = 2 * sample
         move    b1,x0
-        move    x:(r6),a
-        mac     x0,y0,a
+        mac     x0,y0,a x:(r6)-,b        ; a = left + s*panL; b = the right word
+        mac     x0,y1,b y:<la_step3,x0   ; b = right + s*panR; x0 = the step
         move    a1,x:(r6)+
-        move    x:(r6),a
-        mac     x0,y1,a y:<la_step3,x0
-        move    a1,x:(r6)+
+        move    b1,x:(r6)+
 la32_square_done:
         rts
 
@@ -604,24 +625,24 @@ la32_saw_loop:
         mpy     x0,y0,a y:<la_b3,x0
         asl     a       y:<la_rec1,r1
         tfr     a,b     y:<la_sh7,x1
-        sub     x0,b
+        sub     x0,b    r4,r2            ; r2 = FWD until a segment test moves it
         tlt     a,b     r3,r1
         move    b1,y1
-        mpy     y1,x1,a y:<la_sgnbit,x1
-        move    a0,b
-        and     x1,b    y:(r1)+,x0
-        eor     x0,b
-        move    b1,y:<la_rmul
-        move    r4,r2
-        tfr     y1,b    y:<la_2p14,x0
-        tfr     y1,a    y:(r1)+,x1
-        sub     x0,b    y:<la_sh5,y0
-        tge     b,a     r5,r2
-        sub     x1,b
+        mpy     y1,x1,a y:<la_sgnbit,x1  ; a0 = R4 << 8
+        move    a0,a
+        and     x1,a    y:(r1)+,x0       ; x0 = sign base; r1 -> linear length
+        eor     x0,a    y:(r1)+,x1       ; x1 = linear length; r1 -> decay
+        move    a1,y:<la_rmul
+; segment within the half: a = position inside a sine segment - zero in the
+; linear segment, so its index needs no mask - r2 = table; b still holds R4
+        tfr     b,a     y:<la_2p14,x0
+        sub     x0,b    y:<la_zero,y0
+        tge     y0,a    r5,r2
+        sub     x1,b    y:<la_sh5,y0
         tge     b,a     r7,r2
+; table addresses: n2 = square sine index, r0 = resonance sine; x0 = R4
         move    a1,x0
-        mpy     x0,y0,a y:<la_m511,x1
-        and     x1,a    y1,x0
+        mpy     x0,y0,a y1,x0            ; a1 = square index; x0 = R4
         move    a1,n2
         tfr     y1,b    y:<la_m7fe0,x1
         and     x1,b    y:<la_rtab,a
@@ -656,16 +677,13 @@ la32_saw_loop:
         add     x0,a                     ; resonance log + cosine
         move    b1,x1
         move    y:<la_sqlog,b
-        add     x0,b
-        move    b1,y:<la_sqlog           ; square log + cosine
-        move    y:<la_rmul,b
+        add     x0,b    y:<la_rmul,y0
+        tfr     y0,b    b1,y:<la_sqlog   ; save the log while selecting the resonance sign
         eor     x1,b
-        move    b1,y:<la_rmul
-        tfr     y1,b
-        eor     x1,b
-        move    b1,y1                    ; y1 = square sign multiplier
+        tfr     y1,b    b1,y:<la_rmul    ; save that sign while selecting the square sign
+        eor     x1,b    y:<la_m4095,x1   ; XOR uses the cosine sign before loading the mask
 ; unlog both, sum, pan - as in the square loop
-        tfr     a,b     y:<la_m4095,x1
+        tfr     a,b     b1,y1           ; preserve the square sign before replacing b
         and     x1,b    y:<la_sh12,y0
         move    b1,r1
         move    a1,x0
@@ -674,11 +692,9 @@ la32_saw_loop:
         move    a1,r2
         move    y:<la_rmul,y0
         move    x:(r2),x1
-        mpy     x0,x1,a
+        mpy     x0,x1,a y:<la_m4095,x1
         move    a1,x0
-        mpy     x0,y0,b
-        move    y:<la_sqlog,a
-        move    y:<la_m4095,x1
+        mpy     x0,y0,b y:<la_sqlog,a
         and     x1,a    y:<la_sqlog,x0
         move    a1,r1
         move    y:<la_sh12,y0
@@ -690,22 +706,22 @@ la32_saw_loop:
         mpy     x0,x1,a
         move    a1,x0
         mac     x0,y1,b
-        asl     b
+        asl     b       x:(r6)+,a        ; a = the left word; r6 -> right
         asl     b       y:<la_panr,y1
         move    b1,x0
-        move    x:(r6),a
-        mac     x0,y0,a
+        mac     x0,y0,a x:(r6)-,b        ; a = left + s*panL; b = the right word
+        mac     x0,y1,b y:<la_step3,x0   ; b = right + s*panR; x0 = the step
         move    a1,x:(r6)+
-        move    x:(r6),a
-        mac     x0,y1,a y:<la_step3,x0
-        move    a1,x:(r6)+
+        move    b1,x:(r6)+
 la32_saw_done:
         rts
 
 ; Perceptual kernel. Positions, segments and the resonance's log-domain rest
 ; (decay, window, amp base) are computed exactly as above; the record holds
 ; the linear length, the half's signed sine table base, the decay factor and
-; the signed square gain.
+; the signed square gain. The sample is accumulated into a mono bus, one
+; word per frame in the buffer's left slot, and la32_pan_bus pans the bus
+; afterwards: a part's partials share a pan, so the bus pays it once.
 la32_psquare_run:
         move    y:<la_step3,x0
         do      y:<la_frames,la32_psquare_done
@@ -719,61 +735,55 @@ la32_psquare_loop:
         mpy     x0,y0,a y:<la_b3,x0
         asl     a       y:<la_rec1,r1    ; a1 = S4; r1 = half 1 record
 ; half: b = R4, r1 = that half's record
-        tfr     a,b
+        tfr     a,b     r4,r2            ; r2 = FWD until a segment test moves it
         sub     x0,b    y:<la_2p14,x0
         tlt     a,b     r3,r1
-        move    b1,y1                    ; y1 = R4
-; segment within the half: a = position inside a sine segment, r2 = table
-        move    r4,r2
-        tfr     y1,a    y:(r1)+,x1       ; x1 = linear length; r1 -> sine table base
-        tfr     y1,b    y:<la_sh5,y0
-        sub     x0,b
-        tge     b,a     r5,r2
-        sub     x1,b
+        move    b1,y1                    ; y1 = R4; b = R4 as well
+; segment within the half: a = position inside a sine segment - zero in the
+; linear segment, so its index needs no mask - r2 = table
+        tfr     b,a     y:(r1)+,x1       ; x1 = linear length; r1 -> sine table base
+        sub     x0,b    y:<la_zero,y0
+        tge     y0,a    r5,r2
+        sub     x1,b    y:<la_sh5,y0
         tge     b,a     r7,r2
 ; table addresses: n2 = square sine index, r0 = signed resonance sine; x0 = R4
         move    a1,x0
-        mpy     x0,y0,a y:<la_m511,x1
-        and     x1,a    y1,x0            ; a1 = square index; x0 = R4
+        mpy     x0,y0,a y1,x0            ; a1 = square index; x0 = R4
         move    a1,n2
         tfr     y1,b    y:<la_mffe0,x1
         and     x1,b    y:(r1)+,a        ; b1 = R4 & $ffe0; a1 = the half's table base; r1 -> decay
         move    b1,x1
-        mac     x1,y0,a                  ; a1 = base + ((R4 >> 5) & 2047)
+        mac     x1,y0,a y:(r1)+,y1       ; a1 = base + ((R4 >> 5) & 2047); y1 = decay << 15
         move    a1,r0
-; square component and the rest of the resonance log
+; square component and the rest of the resonance log; the record's last two
+; words and the window term ride on the multiplies that need the other half
+; of each pair, so only the sum of the log's parts costs an instruction
         move    l:(r2+n2),b              ; b1 = linear sine * 4 or full scale; b0 = window log
-        move    y:(r1)+,y1               ; y1 = decay << 15; r1 -> square gain
         move    y:<la_rbase,a
-        mac     x0,y1,a y:(r1),y1        ; a1 = rbase + (R4 * decay) >> 8; y1 = signed square gain
-        move    b0,x1
-        add     x1,a    y:<la_m65535,x1  ; a1 = rest of the resonance log
+        mac     x0,y1,a b0,x1            ; a1 = rbase + (R4 * decay) >> 8; x1 = window log
+        add     x1,a    y:(r1)+,y1       ; a1 = the rest of the log; y1 = signed square gain
         move    b1,x0
         mpy     x0,y1,b y:<la_sh4,y0     ; b1 = square component; y0 = 2^19
-; resonance component: gain[rest >> 4] times the signed sine
-        cmp     x1,a
-        tgt     x1,a                     ; the gain table ends at 65535
-        move    a1,x0
-        move    y:<la_gtab,a
+; resonance component: gain[rest >> 4] times the signed sine. The log carries
+; LA32_PERC_BIAS, so a log at or above 65536 overflows 24 bits and the
+; limiter on the full-accumulator move lands it on the table's last bin
+        move    a,x0    y:(r1),a         ; x0 = the log, limited; a = the gain base
         mac     x0,y0,a y:(r0),x1        ; a1 = gain entry address; x1 = signed sine * 4
         move    a1,r1
-        move    y:<la_panl,y0
+        move    y:<la_panl,y0            ; a filler: r1 settles before the read
         move    y:(r1),x0                ; x0 = gain, Q21
         mac     x0,x1,b y:<la_f,y1       ; b1 = sample; y1 = F
 ; the amp ramp: scale by F, then F *= r for the next frame
         move    b1,x0
         mpyr    x0,y1,b y:<la_r,x1       ; b1 = the sample scaled by F; x1 = r
-        mpy     y1,x1,a                  ; a1 = F * r, Q22
-        asl     a
-        move    a,y:<la_f                ; Q23, limited at one
-; pan into the interleaved accumulation buffer; reload the step for the next frame
-        move    b1,x0
-        move    x:(r6),a
-        mac     x0,y0,a y:<la_panr,y1
-        move    a1,x:(r6)+
-        move    x:(r6),a
-        mac     x0,y1,a y:<la_step3,x0
-        move    a1,x:(r6)+
+; accumulate into the bus in the frame's left slot - the part's partials
+; share one pan, applied once per bus by la32_pan_bus. The bus word is read
+; by the ramp's own multiply and stored by its shift, so the accumulate
+; costs one add, which also reloads the step for the next frame
+        mpy     y1,x1,a x:(r6),y0        ; a1 = F * r, Q22; y0 = the bus word
+        add     y0,b    y:<la_step3,x0   ; b = bus + sample; x0 = the step
+        asl     a       b1,x:(r6)+n6     ; store the bus; a = F * r, Q23
+        move    a,y:<la_f                ; limited at one
 la32_psquare_done:
         rts
 
@@ -788,46 +798,42 @@ la32_psaw_loop:
         move    a1,x0
         mpy     x0,y0,a y:<la_b3,x0
         asl     a       y:<la_rec1,r1
-        tfr     a,b
+        tfr     a,b     r4,r2            ; r2 = FWD until a segment test moves it
         sub     x0,b    y:<la_2p14,x0
         tlt     a,b     r3,r1
-        move    b1,y1
-        move    r4,r2
-        tfr     y1,a    y:(r1)+,x1
-        tfr     y1,b    y:<la_sh5,y0
-        sub     x0,b
-        tge     b,a     r5,r2
-        sub     x1,b
+        move    b1,y1                    ; y1 = R4; b = R4 as well
+; segment within the half: a = position inside a sine segment - zero in the
+; linear segment, so its index needs no mask - r2 = table
+        tfr     b,a     y:(r1)+,x1       ; x1 = linear length; r1 -> sine table base
+        sub     x0,b    y:<la_zero,y0
+        tge     y0,a    r5,r2
+        sub     x1,b    y:<la_sh5,y0
         tge     b,a     r7,r2
+; table addresses: n2 = square sine index, r0 = signed resonance sine; x0 = R4
         move    a1,x0
-        mpy     x0,y0,a y:<la_m511,x1
-        and     x1,a    y1,x0
+        mpy     x0,y0,a y1,x0            ; a1 = square index; x0 = R4
         move    a1,n2
         tfr     y1,b    y:<la_mffe0,x1
         and     x1,b    y:(r1)+,a
         move    b1,x1
-        mac     x1,y0,a
+        mac     x1,y0,a y:(r1)+,y1
         move    a1,r0
         move    l:(r2+n2),b
-        move    y:(r1)+,y1
         move    y:<la_rbase,a
-        mac     x0,y1,a y:(r1),y1
-        move    b0,x1
-        add     x1,a    y:<la_m65535,x1
+        mac     x0,y1,a b0,x1
+        add     x1,a    y:(r1)+,y1       ; a1 = the rest of the log; y1 = square gain
         move    b1,x0
-        mpy     x0,y1,b y:<la_sh4,y0
-        cmp     x1,a
-        tgt     x1,a
-        move    a1,x0
-        move    y:<la_gtab,a
+        mpy     x0,y1,b y:<la_sh4,y0     ; b1 = square component; y0 = 2^19
+; resonance component: gain[rest >> 4] times the signed sine. The log carries
+; LA32_PERC_BIAS, so a log at or above 65536 overflows 24 bits and the
+; limiter on the full-accumulator move lands it on the table's last bin
+        move    a,x0    y:(r1),a         ; x0 = the log, limited; a = the gain base
         mac     x0,y0,a y:(r0),x1
         move    a1,r1
-        move    y:<la_panl,y0
+        move    y:<la_wp3,a              ; a filler: r1 settles before the read
         move    y:(r1),x0
-        mac     x0,x1,b                  ; b1 = square + resonance
+        mac     x0,x1,b y:<la_pos21,x1   ; b1 = square + resonance; x1 = 2^21
 ; sawtooth: the signed cosine multiplies the sum
-        move    y:<la_wp3,a
-        move    y:<la_pos21,x1
         add     x1,a    y:<la_mcos11,x1
         and     x1,a    y:<la_sh12,y0    ; a1 = cosine position bits 12-22
         move    a1,x1
@@ -840,17 +846,35 @@ la32_psaw_loop:
 ; the amp ramp: scale by F, then F *= r for the next frame
         move    b1,x0
         mpyr    x0,y1,b y:<la_r,x1       ; b1 = the sample scaled by F; x1 = r
-        mpy     y1,x1,a y:<la_panl,y0    ; a1 = F * r, Q22; y0 = left pan
-        asl     a
-        move    a,y:<la_f                ; Q23, limited at one
-        move    b1,x0
-        move    x:(r6),a
-        mac     x0,y0,a y:<la_panr,y1
-        move    a1,x:(r6)+
-        move    x:(r6),a
-        mac     x0,y1,a y:<la_step3,x0
-        move    a1,x:(r6)+
+; accumulate into the bus in the frame's left slot - the part's partials
+; share one pan, applied once per bus by la32_pan_bus - as in the square
+; kernel, with the bus read and stored beside the ramp's arithmetic
+        mpy     y1,x1,a x:(r6),y0        ; a1 = F * r, Q22; y0 = the bus word
+        add     y0,b    y:<la_step3,x0   ; b = bus + sample; x0 = the step
+        asl     a       b1,x:(r6)+n6     ; store the bus; a = F * r, Q23
+        move    a,y:<la_f                ; limited at one
 la32_psaw_done:
+        rts
+
+; Pan a perceptual render's mono bus into the stereo buffer it occupies the
+; left slots of: sample * panL >> 13 over the bus word, sample * panR >> 13
+; beside it. One partial on the bus makes this the stereo tail the kernels
+; used to carry, word for word; a part's partials share it. Five cycles a
+; frame in internal P, where the fetch and the buffer's bus do not meet;
+; a mix of several buses would accumulate instead of storing.
+la32_pan_bus:
+        move    y:<la_kernel,a
+        tst     a
+        jeq     la32_pan_done           ; the exact kernels pan as they go
+        move    #>LA32_OUTPUT_BASE,r6
+        move    y:<la_panl,y0
+        move    y:<la_panr,y1
+        do      #LA32_PROFILE_FRAMES,la32_pan_done
+        move    x:(r6),x0
+        mpy     x0,y0,a
+        mpy     x0,y1,b a1,x:(r6)+       ; b = the right word; store the left
+        move    b1,x:(r6)+
+la32_pan_done:
         rts
 
         ENDIF
@@ -980,8 +1004,9 @@ profile_install:
         move    a1,b
         rep     #4
         asl     b                       ; run index * 16 ...
-        add     a,b
-        add     a,b                     ; ... + 2: LA32_CONFIG_WORDS words per run
+        asl     a
+        asl     a
+        add     a,b                     ; ... + 4: LA32_CONFIG_WORDS words per run
         move    #>la32_cfg_image,x0
         add     x0,b
         move    b1,r0
@@ -1036,10 +1061,6 @@ command_control:
 ; the entrance and the combs at slot 0, the allpasses at slot 1, which is
 ; the slot their first frame reads and writes.
 reverb_prepare:
-        move    #>$00ffff,x0
-        move    x0,y:<rv_wordmask
-        move    #>$008000,x0
-        move    x0,y:<rv_sign16
         clr     a
         move    #>-1,m0
         move    #>RV_ENT_BASE,r0
@@ -1114,6 +1135,7 @@ command_profile:
         move    x0,y:<la_r
         jsr     profile_prepare
         jsr     la32_kernel_run
+        jsr     la32_pan_bus
         jsr     profile_fold
         jsr     send_reply
         jmp     command_loop
@@ -1140,6 +1162,7 @@ profile_prepare_cleared:
         move    #>-1,m5
         move    #>-1,m6
         move    #>-1,m7
+        move    #>2,n6                  ; the perceptual bus steps a frame at a time
         move    #<la_half0,r3
         move    y:<la_sqbase,a
         move    #>512,x0
@@ -1264,6 +1287,7 @@ la32_control_steady:
 la32_control_next:
         nop
 la32_control_done:
+        jsr     la32_pan_bus
         jsr     profile_fold
         jsr     send_reply
         jmp     command_loop
@@ -1561,11 +1585,10 @@ la32_derive_amp_rising:
         move    b1,y1                   ; the basis: the record's last frame
 ; F = 2^(-|slope| * frames / 4096), Q23, by the gain table's bins
         move    x1,a
-        move    y:<la_m65535,x1
-        cmp     x1,a    y:<la_sh4,y0    ; y0 = 2^19: a right shift by 4
-        tgt     x1,a
-        move    a1,x1
-        mpy     x1,y0,a y:<la_gtab,x1
+        move    #>LA32_PERC_BIAS,x1
+        add     x1,a    y:<la_sh4,y0    ; y0 = 2^19: a right shift by 4
+        move    a,x1                    ; limited: 65536 and above land on the last bin
+        mpy     x1,y0,a y:<la_gtabb,x1
         add     x1,a
         move    a1,r0
         nop
@@ -1599,7 +1622,10 @@ la32_derive_amp_basis:
         move    y1,a
         move    y:<la_cut_res,x1
         add     x1,a
-        move    a1,y:<la_rbase
+        move    #>LA32_PERC_BIAS,x1     ; the kernel clamps by the limiter, and
+        add     x1,a                    ; so does this: a base of 65536 or more
+        move    a,x1                    ; saturates to the bias plus 65535
+        move    x1,y:<la_rbase
         move    y1,a
         move    y:>la_cut_amp,x1
         add     x1,a
@@ -1608,11 +1634,10 @@ la32_derive_amp_basis:
 ; sixteen-unit bins - the resonance's table, read at the bin the amp
 ; term's top twelve bits name, the term clamped at 65535: one read where
 ; the exponent table needs a fraction, a shift and a power of two
-        move    y:<la_m65535,x1
-        cmp     x1,a    y:<la_sh4,y0    ; y0 = 2^19: a right shift by 4
-        tgt     x1,a
-        move    a1,x1
-        mpy     x1,y0,a y:<la_gtab,x1
+        move    #>LA32_PERC_BIAS,x1
+        add     x1,a    y:<la_sh4,y0    ; y0 = 2^19: a right shift by 4
+        move    a,x1                    ; limited: 65536 and above land on the last bin
+        mpy     x1,y0,a y:<la_gtabb,x1
         add     x1,a
         move    a1,r0
         nop

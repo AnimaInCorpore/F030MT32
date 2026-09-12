@@ -54,13 +54,20 @@ COSINE_X = 0x2C00         # perceptual: +/-cosine*1024, 2048, sign in bit 10
 SHIFT_X = 0x3400          # exact: guard, 2^(15-n), zeros
 GAIN_Y = 0x0900           # perceptual: 2^(-(16j+8)/4096)*2^21 for j = -guard..4095
 GAIN_GUARD = 192
+# The perceptual kernels carry the resonance log this far above its value, so
+# a log at or above 65536 overflows 24 bits and the DSP's limiter clamps it to
+# the gain table's last bin instead of a compare and a conditional transfer;
+# the table base they add is lowered by the bias's share. Mirrored by
+# LA32_PERC_BIAS in src/dsp/la32.asm.
+PERC_BIAS = (1 << 23) - 65536
 RESONANCE_Y = 0x1A00      # exact: sine<<2 (log), reversed upper half, 1024
 SINE_Y = 0x2C00           # perceptual: +/-linear sine*4, 2048, twice
 RAMP_Y = 0x3C00           # perceptual amp ramp factors, Q22: 512 rising, 512 falling
 RAMP_STEEP = 512
 CONST_IMAGE_P = 0x0700
-CONFIG_IMAGE_P = 0x0740
-CONFIG_WORDS = 18
+CONFIG_IMAGE_P = 0x0720   # 10 runs of CONFIG_WORDS: $0720-$07e7, clear of the
+                          # constant image below and the tone table at $0800
+CONFIG_WORDS = 20
 
 # The exact kernel's shift table maps an unlog integer part n to 2^(15-n):
 # a zero guard for n = -1, sixteen powers, then zeros up to the largest n any
@@ -72,12 +79,16 @@ SHIFT_ENTRIES = 1088
 
 # Internal Y layout, mirrored by src/dsp/la32.asm: la_wp3 at $10, these
 # fixed words from $11, three scratch words, the frame and block counts,
-# then the CONFIG_WORDS block; la_half1 is its last four words.
-LA_REC1 = 0x39
+# then the CONFIG_WORDS block; la_half1 is its last five words.
+LA_REC1 = 0x38
+# The gain table's zero-argument entry less the bias's share, which the block
+# derivation reads from la_gtabb and the perceptual kernels read from the last
+# word of the half's record, where it rides on a move they already make.
+GAIN_BASE = (GAIN_Y + GAIN_GUARD - (PERC_BIAS >> 4)) & WORD_MASK
 FIXED_CONSTANTS = [
     ("la_wphmask", 0x7FF800),
     ("la_sh5", 1 << 18),
-    ("la_m511", 511),
+    ("la_zero", 0),
     ("la_m7fe0", 0x7FE0),
     ("la_sh12", 1 << 11),
     ("la_m4095", 4095),
@@ -92,8 +103,7 @@ FIXED_CONSTANTS = [
     ("la_rtab", RESONANCE_Y),
     ("la_mffe0", 0xFFE0),
     ("la_sh4", 1 << 19),
-    ("la_m65535", 65535),
-    ("la_gtab", GAIN_Y + GAIN_GUARD),
+    ("la_gtabb", GAIN_BASE),
     ("la_ctab", COSINE_X),
     ("la_mcos11", 0x7FF000),
 ]
@@ -356,16 +366,18 @@ def reverb_words(run: ReverbRun) -> list[int]:
     words = [
         run.input_run,
         feedback[0] << 15, feedback[1] << 15, feedback[2] << 15,
-        dry << 15, wet << 15,
+        dry << 15, wet << 7,                   # wet << 7: its product lands right-justified
         REVERB_COMB_FACTORS[0] << 15,          # entrance low-pass factor
         REVERB_LPF_AMP << 15,                  # entrance output amp
         2,                                     # kernel: reverb
         REVERB_COMB_FACTORS[1] << 15,          # comb filter factor
         (-REVERB_OUT_L[1]) & WORD_MASK,        # comb 2 left tap offset
         (-REVERB_OUT_R[1]) & WORD_MASK,        # comb 2 right tap offset
-        32767, (-32768) & WORD_MASK,           # clipSampleEx bounds
-        1 << 21, 1 << 22,                      # quarter and half
-        0, 0,
+        0xFFFF00, 1 << 5,                      # the floor mask, the input's quarter shift
+        1 << 21, 1 << 22,                      # quarter (unused) and half
+        0, 0,                                  # link scratch, pad
+        0, 0,                                  # rv_outl1, rv_outr3: scratch taps the loop
+                                               # writes before it reads them
     ]
     assert len(words) == CONFIG_WORDS
     return words
@@ -396,23 +408,31 @@ def config_words(tables: Tables, run) -> list[int]:
             1 if config.sawtooth else 0,                          # la_saw
             0,                                                    # la_kernel
             SQUARE_EXACT,                                         # la_sqbase
-            # half 0: sign base, linear length (S4 units), decay << 15, square sign
-            0x400000, d.high_linear >> 4, d.radf << 15, 0x400000,
+            # half 0: sign base, linear length (S4 units), decay << 15, square
+            # sign, and a fifth word the exact kernels never read, so both
+            # kernels' records are the same length
+            0x400000, d.high_linear >> 4, d.radf << 15, 0x400000, 0,
             # half 1
-            0xC00000, d.low_linear >> 4, (d.radf + 1) << 15, 0xC00000,
+            0xC00000, d.low_linear >> 4, (d.radf + 1) << 15, 0xC00000, 0,
         ]
     else:
         gain = square_gain(d.ampt)
+        # la_rbase, biased; a base at or above 65536 silences the resonance
+        # outright, which the biased word can only say as the limiter's ceiling
+        common[4] = (min(d.rbase, 65535) + PERC_BIAS) & WORD_MASK
         words = common + [
             min(config.pan_left, 8191) << 10,                     # la_panl
             min(config.pan_right, 8191) << 10,                    # la_panr
             1 if config.sawtooth else 0,                          # la_saw
             1,                                                    # la_kernel
             SQUARE_PERC,                                          # la_sqbase
-            # half 0: linear length, sine table base, decay << 15, +/-square gain
-            d.high_linear >> 4, SINE_Y, d.radf << 15, gain,
+            # half 0: linear length, sine table base, decay << 15, +/-square
+            # gain, gain table base - the kernels read the base from here, where
+            # it rides on the move that limits the log
+            d.high_linear >> 4, SINE_Y, d.radf << 15, gain, GAIN_BASE,
             # half 1: the sine table copy 1024 words up flips the sign bit
             d.low_linear >> 4, SINE_Y + 1024, (d.radf + 1) << 15, (-gain) & WORD_MASK,
+            GAIN_BASE,
         ]
     assert len(words) == CONFIG_WORDS
     for word in words:
@@ -739,6 +759,7 @@ def main() -> None:
         ("kernel", "print exact, perceptual or reverb"),
         ("image", "print the DSP image a run needs: partial or reverb"),
         ("listing", "print the assembler listing the run's image comes from"),
+        ("dump-symbol", "print the DSP label at which the run's output buffer is final"),
         ("name", "print the run's name"),
     ):
         p = sub.add_parser(name, help=doc)
@@ -780,6 +801,10 @@ def main() -> None:
         print(run.image)
     elif args.command == "listing":
         print("REVERB.LST" if run.image == "reverb" else "LA32.LST")
+    elif args.command == "dump-symbol":
+        # A perceptual render leaves its mono bus for la32_pan_bus to pan;
+        # the partial image runs that pass after every render.
+        print(f"la32_{run.loop}_done" if run.image == "reverb" else "la32_pan_done")
     elif args.command == "name":
         print(run.name)
     elif args.command == "constants":
